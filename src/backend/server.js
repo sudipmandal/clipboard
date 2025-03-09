@@ -4,11 +4,15 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const fs = require('fs');
 const { execSync } = require('child_process');
+const path = require('path');
 
 const app = express();
 const port = 3000; // Use port 3000 for the backend server
 
 const dbFilePath = '/database.sqlite';
+
+// Serve static files from the dist directory
+app.use(express.static('/app/dist'));
 
 // Check if the database file exists
 if (!fs.existsSync(dbFilePath)) {
@@ -30,6 +34,9 @@ db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'", 
 
 app.use(cors());
 app.use(bodyParser.json());
+
+// Serve static files from the dist directory
+app.use(express.static(path.join(__dirname, '../../dist')));
 
 // Endpoint to get messages
 app.get('/api/messages', (req, res) => {
@@ -65,6 +72,7 @@ app.delete('/api/messages/:id', (req, res) => {
     res.status(204).send();
   });
 });
+
 
 app.listen(port, () => {
   console.log(`API Backend is running on http://localhost:${port}`);

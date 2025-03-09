@@ -15,7 +15,7 @@ FROM node:23-alpine AS backend-stage
 WORKDIR /app
 
 COPY src/backend/package*.json ./backend/
-RUN mkdir -p backend && cd backend && npm install sqlite3 express body-parser cors
+RUN mkdir -p backend && cd backend && npm install sqlite3 express body-parser cors path
 
 COPY src/backend ./backend
 COPY --from=build-stage /app/dist /app/dist
