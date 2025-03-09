@@ -3,9 +3,9 @@
     <div class="chat-container">
       <div class="chat-messages" ref="chatMessages">
         <ChatMessage
-          v-for="(message, index) in messages"
-          :id="message.id"
-          :message="message"
+          v-for="(m, index) in messages"
+          :id="m.id"
+          :message="m.message"
           @deleteMessage="deleteMessage"
         />
       </div>

@@ -2,6 +2,7 @@
   <div class="chat-message">
     <div v-html="message"></div>
     <button class="delete-button" @click="deleteMessage">Delete</button>
+    <button class="copy-button" @click="copyToClipboard">{{ copyButtonLabel }}</button>
   </div>
 </template>
 
@@ -17,9 +18,33 @@ export default {
       required: true,
     },
   },
+  data() {
+    return {
+      copyButtonLabel: 'Copy',
+    };
+  },
   methods: {
     deleteMessage() {
       this.$emit('deleteMessage', this.id);
+    },
+    copyToClipboard() {
+      const el = document.createElement('textarea');
+      el.value = this.message.replace(/<[^>]*>?/gm, ''); // Strip HTML tags
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
+
+      // Change button label and color
+      this.copyButtonLabel = 'Done';
+      const copyButton = this.$el.querySelector('.copy-button');
+      copyButton.style.backgroundColor = '#006400'; // Dark green
+
+      // Revert button label and color after 2 seconds
+      setTimeout(() => {
+        this.copyButtonLabel = 'Copy';
+        copyButton.style.backgroundColor = '#4CAF50'; // Original green
+      }, 2000);
     },
   },
 };
@@ -40,7 +65,7 @@ export default {
   border-radius: 5px;
 }
 
-.delete-button {
+.delete-button, .copy-button {
   position: absolute;
   top: 10px;
   right: 10px;
@@ -52,7 +77,16 @@ export default {
   cursor: pointer;
 }
 
+.copy-button {
+  right: 90px; /* Adjust position to avoid overlap with delete button */
+  background-color: #4CAF50;
+}
+
 .delete-button:hover {
   background-color: #ff1a1a;
+}
+
+.copy-button:hover {
+  background-color: #45a049;
 }
 </style>
