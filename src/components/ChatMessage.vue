@@ -20,7 +20,7 @@ export default {
   },
   data() {
     return {
-      copyButtonLabel: 'Copy',
+      copyButtonLabel: 'Text Copy',
     };
   },
   methods: {
@@ -42,7 +42,7 @@ export default {
 
       // Revert button label and color after 2 seconds
       setTimeout(() => {
-        this.copyButtonLabel = 'Copy';
+        this.copyButtonLabel = 'Text Copy';
         copyButton.style.backgroundColor = '#4CAF50'; // Original green
       }, 2000);
     },

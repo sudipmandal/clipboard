@@ -1,17 +1,29 @@
 # Clipboard App
 
-A bloat free simple selfhosted containerized clipboard app that can be accessed from any browser. App uses sqlite3 as its database and runs as a single container.
+A bloat-free, simple, self-hosted, containerized clipboard app that can be accessed from any browser. The app uses SQLite3 as its database.
+
+## Prerequisites
+
+- Docker must be installed on your machine. You can download and install Docker from the [official Docker website](https://www.docker.com/get-started).
+
+## Clone the Repository
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/sudipmandal/clipboard.git
+   cd clipboard
+   ```
 
 ## Docker Instructions
 
 1. **Build the Docker image:**
    ```bash
-   docker build -t clipboard-app .
+   docker build -t clipboard .
    ```
 
 2. **Run the Docker container:**
    ```bash
-   docker run -d -p 80:80 --name clipboard-app clipboard-vuejs-app
+   docker run -d -p 3000:3000 --name clippy clipboard:latest
    ```
 
    Alternatively, you can use Docker Compose to run the container:
@@ -23,10 +35,10 @@ A bloat free simple selfhosted containerized clipboard app that can be accessed 
 
    services:
      clipboard-app:
-       image: clipboard-vuejs-app
+       image: clipboard
        build: .
        ports:
-         - "80:80"
+         - "3000:3000"
    ```
 
    Then run the following command to start the container:
@@ -35,15 +47,8 @@ A bloat free simple selfhosted containerized clipboard app that can be accessed 
    ```
 
 3. **Open your browser:**
-   Navigate to `http://<server-url>` to see your application in action.
-
-## Usage
-
-- Modify the `src/components/ChatInput.vue` file to change the chat input behavior.
-- Modify the `src/components/ChatMessage.vue` file to change the chat message display.
-- Add additional components in the `src/components` directory as needed.
-- Update styles in the `src/assets` directory.
+   Navigate to `http://<server-url>:3000` to see your application in action.
 
 ## License
 
-This project is licensed under the  GNU GPLv3 License.
+This project is licensed under the GNU GPLv3 License.
