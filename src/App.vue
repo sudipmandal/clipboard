@@ -4,7 +4,7 @@
       <div class="chat-messages" ref="chatMessages">
         <ChatMessage
           v-for="(message, index) in messages"
-          :key="index"
+          :id="message.id"
           :message="message"
           @deleteMessage="deleteMessage"
         />
@@ -34,6 +34,7 @@ export default {
     async fetchMessages() {
       try {
         const response = await axios.get('/api/messages');
+        console.log('Fetched messages:', response); // Debugging line
         this.messages = response.data;
         this.scrollToBottom();
       } catch (error) {
@@ -64,7 +65,7 @@ export default {
       });
     },
   },
-  created() {
+  mounted() {
     this.fetchMessages();
   },
 };

@@ -46,7 +46,7 @@ export default {
             text: this.message,
           });
           console.log('Message saved:', response.data);
-          this.$emit('sendMessage',JSON.parse(JSON.stringify(this.message)) );
+          this.$emit('sendMessage',response.data );
           this.message = '';
         } catch (error) {
           console.error('Error saving message:', error);
