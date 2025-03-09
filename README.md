@@ -6,7 +6,25 @@ A bloat-free, simple, self-hosted, containerized clipboard app that can be acces
 
 - Docker must be installed on your machine. You can download and install Docker from the [official Docker website](https://www.docker.com/get-started).
 
-## Clone the Repository
+## QUICK DEPLOY
+- Latest code is available as image on docker hub, self host it as follows
+
+   ```bash
+   docker run -d -p 3000:3000 --name clippy sudipthegreat:clipboard
+   ```
+
+   
+   ```yaml
+   version: '3.8'
+
+   services:
+     clipboard:
+       image: sudipthegreat/clipboard:latest
+       ports:
+         - "3000:3000"
+   ```
+
+## BUILD FROM SOURCE
 
 1. **Clone the repository:**
    ```bash
@@ -14,14 +32,12 @@ A bloat-free, simple, self-hosted, containerized clipboard app that can be acces
    cd clipboard
    ```
 
-## Docker Instructions
-
-1. **Build the Docker image:**
+2. **Build the Docker image:**
    ```bash
    docker build -t clipboard .
    ```
 
-2. **Run the Docker container:**
+3. **Run the Docker container:**
    ```bash
    docker run -d -p 3000:3000 --name clippy clipboard:latest
    ```
@@ -46,7 +62,7 @@ A bloat-free, simple, self-hosted, containerized clipboard app that can be acces
    docker-compose up -d
    ```
 
-3. **Open your browser:**
+4. **Open your browser:**
    Navigate to `http://<server-url>:3000` to see your application in action.
 
 ## License
