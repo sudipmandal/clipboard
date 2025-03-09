@@ -1,7 +1,7 @@
 <template>
   <div class="chat-input">
     <quill-editor
-      v-model="message"
+      v-model:value="message"
       :options="editorOptions"
       @blur="onBlur"
     />
@@ -42,11 +42,11 @@ export default {
       console.log('Message:', this.message); // Debugging line
       if (this.message.trim()) {
         try {
-          const response = await axios.post('/messages', {
+          const response = await axios.post('/api/messages', {
             text: this.message,
           });
           console.log('Message saved:', response.data);
-          this.$emit('sendMessage', response.data);
+          this.$emit('sendMessage',JSON.parse(JSON.stringify(this.message)) );
           this.message = '';
         } catch (error) {
           console.error('Error saving message:', error);

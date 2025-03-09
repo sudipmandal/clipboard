@@ -1,11 +1,12 @@
 <template>
   <div id="app">
     <div class="chat-container">
-      <div class="chat-messages">
+      <div class="chat-messages" ref="chatMessages">
         <ChatMessage
           v-for="(message, index) in messages"
           :key="index"
           :message="message"
+          @deleteMessage="deleteMessage"
         />
       </div>
       <ChatInput @sendMessage="addMessage" />
@@ -14,6 +15,7 @@
 </template>
 
 <script>
+import axios from 'axios';
 import ChatInput from './components/ChatInput.vue';
 import ChatMessage from './components/ChatMessage.vue';
 
@@ -29,9 +31,41 @@ export default {
     };
   },
   methods: {
-    addMessage(message) {
-      this.messages.push(message);
+    async fetchMessages() {
+      try {
+        const response = await axios.get('/api/messages');
+        this.messages = response.data;
+        this.scrollToBottom();
+      } catch (error) {
+        console.error('Error fetching messages:', error);
+      }
     },
+    async addMessage(message) {
+      try {
+       // const response = await axios.post('/api/messages', message);
+        this.messages.push(message);
+        this.scrollToBottom();
+      } catch (error) {
+        console.error('Error adding message:', error);
+      }
+    },
+    async deleteMessage(messageId) {
+      try {
+        await axios.delete(`/api/messages/${messageId}`);
+        this.messages = this.messages.filter(message => message.id !== messageId);
+      } catch (error) {
+        console.error('Error deleting message:', error);
+      }
+    },
+    scrollToBottom() {
+      this.$nextTick(() => {
+        const chatMessages = this.$refs.chatMessages;
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      });
+    },
+  },
+  created() {
+    this.fetchMessages();
   },
 };
 </script>
