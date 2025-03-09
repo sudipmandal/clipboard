@@ -15,7 +15,7 @@ const dbFilePath = '/database.sqlite';
 app.use(express.static('/app/dist'));
 
 // Check if the database file exists
-if (!fs.existsSync(dbFilePath)) {
+while (!fs.existsSync(dbFilePath)) {
   console.log('Database file not found. Initializing database...');
   execSync('node /app/backend/initSQLite.js');
 }
@@ -75,5 +75,5 @@ app.delete('/api/messages/:id', (req, res) => {
 
 
 app.listen(port, () => {
-  console.log(`API Backend is running on http://localhost:${port}`);
+  console.log(`App running on http://localhost:${port}`);
 });
