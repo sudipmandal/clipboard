@@ -14,6 +14,8 @@ jspm_packages/
 # Build directories
 dist/
 build/
+playwright-report/
+test-results/
 
 # Vite
 .vite/

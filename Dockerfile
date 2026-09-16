@@ -1,33 +1,24 @@
-# Stage 1: Build the Vue.js project
-FROM node:23-alpine AS build-stage
-
+# syntax=docker/dockerfile:1
+FROM node:24-alpine AS build
 WORKDIR /app
-
 COPY package*.json ./
-RUN npm install
+RUN npm ci --include=dev
+COPY index.html vite.config.js ./
+COPY src ./src
+COPY tests ./tests
+RUN npm run test && npm run build
 
-COPY . .
-RUN npm run build
-
-# Stage 2: Set up the backend and initialize SQLite
-FROM node:23-alpine AS backend-stage
-
+FROM node:24-alpine AS production
 WORKDIR /app
-
-COPY src/backend/package*.json ./backend/
-RUN mkdir -p backend && cd backend && npm install sqlite3 express body-parser cors path
-
+USER root
+ENV NODE_ENV=production DATABASE_PATH=/data/database.sqlite LEGACY_DATABASE_PATH=/database.sqlite \
+    MAX_IMAGE_BYTES=5242880 MAX_ENTRY_BYTES=10485760 MAX_DATABASE_BYTES=262144000
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 COPY src/backend ./backend
-COPY --from=build-stage /app/dist /app/dist
-RUN node /app/backend/initSQLite.js
-
-# Stage 3: Run the backend server and serve the Vue.js files
-FROM node:23-alpine AS production-stage
-
-WORKDIR /app
-
-COPY --from=backend-stage /app /app
-
+COPY --from=build /app/dist ./dist
+RUN mkdir -p /data
 EXPOSE 3000
-
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/healthz >/dev/null || exit 1
 CMD ["node", "/app/backend/server.js"]
