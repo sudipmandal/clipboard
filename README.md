@@ -1,8 +1,8 @@
 # Clipboard App
 
-A bloat-free, simple, self-hosted, containerized clipboard app that can be accessed from any browser. The app uses SQLite3 as its database.
-This facilitates copying text/image from one machine to another or between phone and computer quickly, intended to be used in a homelab environment with docker
-Lightweight web application that does not consume much resource on the host server
+* A bloat-free, simple, self-hosted, containerized clipboard app that can be accessed from any browser. The app uses SQLite3 as its database.
+* This facilitates copying text/image from one machine to another or between phone and computer quickly, intended to be used in a homelab environment with docker
+* Lightweight web application that does not consume much resource on the host server
 
 <img width="2842" height="1484" alt="image" src="https://github.com/user-attachments/assets/93945927-ee06-40ba-9196-c268fbec6683" />
 
