@@ -188,6 +188,32 @@ test('restore is rejected after the server-side undo window expires', async () =
   }
 });
 
+test('pinned entries bypass retention until they are unpinned', async () => {
+  const server = await startServer({ RETENTION_TIME: '1s', PURGE_INTERVAL_MS: '300' });
+  try {
+    const pinned = await (await post(server.baseURL, '<p>keep pinned</p>')).json();
+    const expiring = await (await post(server.baseURL, '<p>expire normally</p>')).json();
+    const patched = await fetch(`${server.baseURL}/api/messages/${pinned.id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_pinned: true }),
+    });
+    assert.equal(patched.status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 2600));
+    let entries = await (await fetch(`${server.baseURL}/api/messages`)).json();
+    assert.deepEqual(entries.map((entry) => entry.id), [pinned.id]);
+    assert.equal(entries[0].is_pinned, true);
+    assert.equal(entries.some((entry) => entry.id === expiring.id), false);
+
+    assert.equal((await fetch(`${server.baseURL}/api/messages/${pinned.id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_pinned: false }),
+    })).status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    entries = await (await fetch(`${server.baseURL}/api/messages`)).json();
+    assert.deepEqual(entries, []);
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test('entries older than RETENTION_TIME are purged', async () => {
   const server = await startServer({ RETENTION_TIME: '1s', PURGE_INTERVAL_MS: '300' });
   try {

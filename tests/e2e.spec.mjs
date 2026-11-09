@@ -23,7 +23,7 @@ test('desktop layout fills viewport and keeps composer action visible', async ({
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(page.locator('.entries-panel')).toBeVisible();
   await expect(page.locator('.composer-panel')).toBeVisible();
-  await expect(page.getByText(/^v1\.4\.0$/)).toBeVisible();
+  await expect(page.getByText(/^v1\.5\.0$/)).toBeVisible();
   const entries = await page.locator('.entries-panel').boundingBox();
   const composer = await page.locator('.composer-panel').boundingBox();
   const send = await page.getByRole('button', { name: 'Send entry' }).boundingBox();
@@ -122,4 +122,36 @@ test('200 percent zoom equivalent reflows without horizontal overflow', async ({
   await page.setViewportSize({ width: 640, height: 700 });
   await expect(page.getByRole('button', { name: 'Send entry' })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBe(false);
+});
+
+test('search matches visible text after HTML entity decoding', async ({ page, request }) => {
+  const marker = `entity-${Date.now()}`;
+  const created = await request.post('/api/messages', {
+    data: { text: `<p>${marker} Alpha &amp; Beta <strong>Needle</strong></p>` },
+  });
+  const entry = await created.json();
+  try {
+    await page.reload();
+    await page.getByRole('searchbox', { name: 'Search entries' }).fill(`${marker} alpha & beta`);
+    await expect(page.locator('.entry-card', { hasText: marker })).toBeVisible();
+  } finally {
+    await request.delete(`/api/messages/${entry.id}`);
+  }
+});
+
+test('auto-refresh observes a remote pin change when ordering stays unchanged', async ({ page, request }) => {
+  const marker = `pin-sync-${Date.now()}`;
+  const older = await (await request.post('/api/messages', { data: { text: `${marker}-older` } })).json();
+  const newest = await (await request.post('/api/messages', { data: { text: `${marker}-newest` } })).json();
+  try {
+    await page.reload();
+    await page.getByRole('button', { name: /Auto-refresh/ }).click();
+    const pinned = await request.patch(`/api/messages/${newest.id}`, { data: { is_pinned: true } });
+    expect(pinned.status()).toBe(200);
+    const newestCard = page.locator('.entry-card', { hasText: `${marker}-newest` });
+    await expect(newestCard.getByRole('button', { name: 'Unpin' })).toBeVisible({ timeout: 5000 });
+  } finally {
+    await request.delete(`/api/messages/${newest.id}`);
+    await request.delete(`/api/messages/${older.id}`);
+  }
 });

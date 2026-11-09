@@ -94,6 +94,8 @@ services:
 * Long entries are collapsed after about 20 lines (**Show more**). A deleted entry can be restored with **Undo** for a few seconds.
 * **Guide** (top right) opens a short in-app user guide.
 * Use the sun/moon button to switch between light and dark themes; your browser remembers the choice.
+* Pin important entries at the top of the list. Pinned entries intentionally bypass `RETENTION_TIME` and remain stored until they are unpinned or manually deleted.
+* Use the search field to filter for specific content
 
 ## Command line (curl)
 
@@ -124,7 +126,7 @@ labels:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RETENTION_TIME` | `0` (keep forever) | Delete entries older than this: `90m`, `36h`, `10d`, `2w`; a bare number means days |
+| `RETENTION_TIME` | `0` (keep forever) | Delete unpinned entries older than this: `90m`, `36h`, `10d`, `2w`; a bare number means days. Pinned entries are exempt until unpinned. |
 | `MAX_ENTRY_BYTES` | `10485760` | Maximum size of one entry |
 | `MAX_IMAGE_BYTES` | `5242880` | Maximum size of one embedded image |
 | `MAX_DATABASE_BYTES` | `262144000` | Total storage limit |
@@ -132,7 +134,7 @@ labels:
 
 ## Release
 
-Current application version: **1.4.0**. The two minor releases add dark mode and the lab workflow improvements (terminal API, auto-refresh, retention, soft-delete undo, monospace entries, and the in-app guide).
+Current application version: **1.5.0**. This release adds pinned entries and visible-text search, improves dark-mode Undo contrast, and keeps cross-client pin state synchronized.
 
 ## Security
 

@@ -23,6 +23,7 @@
           <h3><i class="bi bi-collection" aria-hidden="true"></i> Saved entries</h3>
           <ul>
             <li>Newest entries are on top. <strong>Auto-refresh</strong> reloads the list every 3 s so entries from other machines appear; your browser remembers the setting.</li>
+            <li><strong>Search</strong> can be used to filter for specific content.</li>
             <li>Entries longer than about 20 lines are collapsed: use <strong>Show more</strong> / <strong>Show less</strong>.</li>
             <li v-if="retention && retention !== 'off'">Entries are deleted automatically after <strong>{{ retention }}</strong>.</li>
             <li v-else-if="retention === 'off'">Entries are kept until you delete them.</li>
@@ -34,6 +35,7 @@
           <dl class="guide-controls">
             <dt><span class="chip chip-id">#12</span></dt><dd>Entry number. Click it to copy the <code>curl</code> command that prints this entry in a terminal.</dd>
             <dt><span class="chip"><i class="bi bi-terminal" aria-hidden="true"></i> Mono</span></dt><dd>Switch between monospace (CLI output) and normal text. Shared with everyone.</dd>
+            <dt><span class="chip chip-icon"><i class="bi bi-pin-angle" aria-hidden="true"></i></span></dt><dd>Pin the entry: keeps it at the top and exempts it from automatic retention until it is unpinned.</dd>
             <dt><span class="chip chip-icon"><i class="bi bi-copy" aria-hidden="true"></i></span></dt><dd>Copy the entry: formatted for documents and mail, plain text with line breaks for terminals.</dd>
             <dt><span class="chip chip-icon chip-danger"><i class="bi bi-trash3" aria-hidden="true"></i></span></dt><dd>Delete. Click <strong>Undo</strong> in the message at the bottom within 8 s to bring it back.</dd>
           </dl>

@@ -28,6 +28,10 @@
             <h2 id="entries-title">Saved entries</h2>
           </div>
           <div class="heading-actions">
+            <div class="search-box">
+              <i class="bi bi-search" aria-hidden="true"></i>
+              <input type="search" v-model="searchQuery" placeholder="Search..." aria-label="Search entries">
+            </div>
             <button
               class="refresh-toggle"
               :class="{ 'is-active': autoRefresh }"
@@ -37,29 +41,36 @@
               @click="toggleAutoRefresh"
             >
               <i class="bi bi-arrow-repeat" aria-hidden="true"></i>
-              <span>Auto-refresh</span>
+              <span class="refresh-text">Auto-refresh</span>
             </button>
             <span class="entry-count" :aria-label="`${messages.length} saved entries`">{{ messages.length }}</span>
           </div>
         </div>
 
         <div class="entries-scroll" ref="chatMessages" aria-live="polite">
-          <TransitionGroup v-if="messages.length" name="entry-list" tag="div" class="entries-list">
+          <TransitionGroup v-if="filteredMessages.length" name="entry-list" tag="div" class="entries-list">
             <ChatMessage
-              v-for="message in messages"
+              v-for="message in filteredMessages"
               :key="message.id"
               :id="message.id"
               :message="message.message"
               :created-at="message.created_at"
               :mono="Boolean(message.mono)"
+              :is-pinned="Boolean(message.is_pinned)"
               @deleteMessage="deleteMessage"
               @toggleMono="toggleMono"
+              @togglePin="togglePin"
             />
           </TransitionGroup>
-          <div v-else class="empty-state">
+          <div v-else-if="messages.length === 0" class="empty-state">
             <span class="empty-illustration" aria-hidden="true"><i class="bi bi-clipboard2-heart"></i></span>
             <h3>No saved entries yet</h3>
             <p>Create one in the composer to get started.</p>
+          </div>
+          <div v-else class="empty-state">
+            <span class="empty-illustration" aria-hidden="true"><i class="bi bi-search"></i></span>
+            <h3>No results found</h3>
+            <p>We couldn't find anything matching "{{ searchQuery }}".</p>
           </div>
         </div>
       </section>
@@ -127,7 +138,20 @@ export default {
       autoRefresh: readAutoRefreshSetting(),
       retention: '',
       undoId: null,
+      searchQuery: ''
     };
+  },
+  computed: {
+    filteredMessages() {
+      if (!this.searchQuery) return this.messages;
+      const query = this.searchQuery.toLowerCase();
+
+      return this.messages.filter(msg => {
+        const document = new DOMParser().parseFromString(msg.message, 'text/html');
+        const visibleText = document.body.textContent.toLowerCase();
+        return visibleText.includes(query);
+      });
+    }
   },
   created() {
     this.refreshTimer = null;
@@ -142,7 +166,7 @@ export default {
         const response = await fetch('api/messages', { cache: 'no-store' });
         if (!response.ok) throw new Error(`Load failed (${response.status})`);
         const rows = await response.json();
-        const signature = (list) => list.map((entry) => `${entry.id}:${entry.mono ? 1 : 0}`).join(',');
+        const signature = (list) => list.map((entry) => `${entry.id}:${entry.mono ? 1 : 0}:${entry.is_pinned ? 1 : 0}`).join(',');
         if (signature(rows) !== signature(this.messages)) this.messages = rows;
       } catch (error) {
         console.error('Unable to fetch entries:', error);
@@ -169,7 +193,8 @@ export default {
       if (this.autoRefresh && !document.hidden) this.fetchMessages();
     },
     addMessage(message) {
-      this.messages.unshift(message);
+      this.messages.push(message);
+      this.sortMessages();
       this.scrollToTop();
     },
     async deleteMessage(messageId) {
@@ -199,7 +224,8 @@ export default {
         const response = await fetch(`api/messages/${messageId}/restore`, { method: 'PUT' });
         if (!response.ok) throw new Error(`Restore failed (${response.status})`);
         const entry = await response.json();
-        this.messages = [...this.messages.filter((message) => message.id !== entry.id), entry].sort((a, b) => b.id - a.id);
+        this.messages = [...this.messages.filter((message) => message.id !== entry.id), entry];
+        this.sortMessages();
       } catch (error) {
         console.error('Unable to restore entry:', error);
       }
@@ -240,6 +266,34 @@ export default {
       this.darkMode = !this.darkMode;
       document.documentElement.dataset.theme = this.darkMode ? 'dark' : '';
       try { localStorage.setItem('theme', this.darkMode ? 'dark' : 'light'); } catch { /* storage unavailable */ }
+    },
+    async togglePin(messageId, isPinned) {
+      const target = this.messages.find((message) => message.id === messageId);
+      if (!target) return;
+
+      const previous = target.is_pinned;
+      target.is_pinned = isPinned;
+
+      this.sortMessages()
+
+      try {
+        const response = await fetch(`api/messages/${messageId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ is_pinned: isPinned }),
+        });
+        if (!response.ok) throw new Error(`Update failed (${response.status})`);
+      } catch (error) {
+        target.is_pinned = previous;
+        this.sortMessages();
+        console.error('Unable to update entry:', error);
+      }
+    },
+    sortMessages() {
+      this.messages.sort((a, b) => {
+        if (a.is_pinned !== b.is_pinned) return a.is_pinned ? -1 : 1;
+        return b.id - a.id;
+      });
     },
   },
   mounted() {
@@ -302,6 +356,9 @@ export default {
   --badge-border: #e8b69f;
   --count-border: #9bd8cb;
   --icon-color: #9a3e26;
+  --undo-btn-bg: var(--primary-soft);
+  --undo-btn-bg-hover: var(--surface-hover);
+  --undo-btn-text: var(--pre-bg);
 }
 [data-theme="dark"] {
   color-scheme: dark;
@@ -340,6 +397,9 @@ export default {
   --badge-border: #5c2415;
   --count-border: #1a423a;
   --icon-color: #f08a6b;
+  --undo-btn-bg: var(--primary);
+  --undo-btn-bg-hover: var(--primary-dark);
+  --undo-btn-text: var(--bg);
 }
 * { box-sizing: border-box; }
 html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
@@ -369,9 +429,9 @@ h1 { color: var(--h1-color); font-size: 21px; font-weight: 750; letter-spacing: 
 .panel-heading { display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; min-height: 76px; padding: 15px 20px; border-bottom: 1px solid var(--border); background: linear-gradient(90deg, var(--surface), var(--surface-soft)); }
 .panel-heading h2 { font-size: 18px; font-weight: 740; letter-spacing: -.3px; }
 .eyebrow { display: block; margin-bottom: 3px; color: var(--primary-dark); font-size: 10px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
-.entry-count { display: grid; place-items: center; min-width: 30px; height: 30px; padding: 0 9px; border: 1px solid var(--count-border); border-radius: 999px; background: var(--primary-soft); color: var(--primary-dark); font-size: 12px; font-weight: 800; }
-.heading-actions { display: flex; align-items: center; gap: 10px; }
-.refresh-toggle { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 11px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: var(--surface-soft); font-size: 12px; font-weight: 700; cursor: pointer; transition: color .18s ease, background .18s ease, border-color .18s ease; }
+.entry-count { display: grid; place-items: center; min-width: 30px; height: 30px; padding: 0 9px; border: 1px solid var(--count-border); border-radius: 999px; background: var(--primary-soft); color: var(--primary-dark); font-size: 12px; font-weight: 800; flex-shrink: 0; }
+.heading-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.refresh-toggle { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 11px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: var(--surface-soft); font-size: 12px; font-weight: 700; cursor: pointer; transition: color .18s ease, background .18s ease, border-color .18s ease; white-space: nowrap; flex-shrink: 0; }
 .refresh-toggle:hover { color: var(--primary-dark); border-color: var(--border-highlight); background: var(--surface-hover); }
 .refresh-toggle.is-active { color: #fff; border-color: var(--primary); background: var(--primary); }
 .refresh-toggle.is-active:hover { background: var(--primary-dark); }
@@ -379,10 +439,10 @@ h1 { color: var(--h1-color); font-size: 21px; font-weight: 750; letter-spacing: 
 @keyframes refresh-spin { to { transform: rotate(360deg); } }
 .undo-toast { position: fixed; z-index: 50; left: 50%; bottom: 22px; transform: translateX(-50%); display: flex; align-items: center; gap: 12px; padding: 10px 10px 10px 16px; border-radius: 14px; color: #fff; background: var(--pre-bg); box-shadow: 0 14px 34px var(--shadow-medium); font-size: 13px; }
 .undo-toast > .bi-trash3 { color: var(--secondary); }
-.undo-button { padding: 6px 14px; border: 0; border-radius: 9px; color: var(--pre-bg); background: var(--primary-soft); font-weight: 800; cursor: pointer; }
-.undo-button:hover { background: var(--surface); }
+.undo-button { padding: 6px 14px; border: 0; border-radius: 9px; color: var(--undo-btn-text); background: var(--undo-btn-bg); font-weight: 800; cursor: pointer; }
+.undo-button:hover { background: var(--undo-btn-bg-hover); }
 .toast-close { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: 8px; color: var(--muted); background: transparent; cursor: pointer; }
-.toast-close:hover { color: #fff; background: var(--editor-highlight); }
+.toast-close:hover { color: #fff; background: var(--placeholder); }
 .entries-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; scroll-behavior: smooth; scrollbar-color: var(--scrollbar-thumb) transparent; }
 .entries-list { display: grid; gap: 12px; }
 .empty-state { height: 100%; min-height: 220px; display: grid; place-content: center; justify-items: center; padding: 24px; text-align: center; color: var(--muted); }
@@ -401,6 +461,11 @@ h1 { color: var(--h1-color); font-size: 21px; font-weight: 750; letter-spacing: 
 .entry-list-enter-from { opacity: 0; transform: translateY(-8px); }
 .entry-list-leave-to { opacity: 0; transform: translateY(8px); }
 .entry-list-move { transition: transform .22s ease; }
+.search-box { display: flex; align-items: center; gap: 6px; padding: 0 12px; height: 30px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-soft); color: var(--muted); transition: border-color .18s ease, background .18s ease, box-shadow .18s ease; }
+.search-box:focus-within { border-color: var(--primary); background: var(--surface); box-shadow: 0 0 0 3px var(--focus-soft); }
+.search-box input { border: 0; background: transparent; color: var(--text); font-size: 12px; font-weight: 500; width: 100px; outline: none; transition: width .2s ease; }
+.search-box input::placeholder { color: var(--placeholder); }
+.search-box input:focus { width: 160px; }
 @media (max-width: 760px) {
   html, body, #app { overflow: auto; }
   .app-shell { min-height: 100dvh; height: auto; padding: 10px; }
@@ -411,6 +476,13 @@ h1 { color: var(--h1-color); font-size: 21px; font-weight: 750; letter-spacing: 
   .composer-panel.is-collapsed { min-height: 52px; height: 52px; }
   .collapse-button, .composer-panel.is-collapsed .collapse-button { top: 0; left: 50%; width: 58px; height: 32px; transform: translate(-50%, -50%) rotate(90deg); }
   .collapse-button:hover { transform: translate(-50%, -50%) rotate(90deg) scale(1.05); }
+  .search-box input { width: 70px; }
+  .search-box input:focus { width: 110px; }
+}
+@media (max-width: 950px) {
+  .refresh-text { display: none; }
+  .search-box input { width: 70px; }
+  .search-box input:focus { width: 110px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
