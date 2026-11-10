@@ -136,6 +136,8 @@ labels:
 
 Current application version: **1.5.0**. This release adds pinned entries and visible-text search, improves dark-mode Undo contrast, and keeps cross-client pin state synchronized.
 
+Pushing a semantic-version tag such as `v1.5.0` starts the GitHub Actions workflow. The tag build publishes the multi-architecture Docker image and creates a GitHub Release with generated release notes. GitHub automatically provides source-code archives in `.zip` and `.tar.gz` formats for the tag.
+
 ## Security
 
 The dependency lockfile pins patched releases for all known production advisories. In particular, Express's transitive `body-parser` dependency is overridden to `2.4.0`, preventing unauthenticated denial of service through malformed compressed request bodies (GHSA-27r3-jxmh-p828).
