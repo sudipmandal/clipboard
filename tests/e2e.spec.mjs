@@ -23,7 +23,7 @@ test('desktop layout fills viewport and keeps composer action visible', async ({
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(page.locator('.entries-panel')).toBeVisible();
   await expect(page.locator('.composer-panel')).toBeVisible();
-  await expect(page.getByText(/^v1\.5\.0$/)).toBeVisible();
+  await expect(page.getByText(/^v1\.6\.0$/)).toBeVisible();
   const entries = await page.locator('.entries-panel').boundingBox();
   const composer = await page.locator('.composer-panel').boundingBox();
   const send = await page.getByRole('button', { name: 'Send entry' }).boundingBox();
@@ -154,4 +154,103 @@ test('auto-refresh observes a remote pin change when ordering stays unchanged', 
     await request.delete(`/api/messages/${newest.id}`);
     await request.delete(`/api/messages/${older.id}`);
   }
+});
+
+test('web addresses get an open-in-new-tab icon that keeps the visible text and its punctuation together', async ({ page, request }) => {
+  const marker = `links-${Date.now()}`;
+  const created = await request.post('/api/messages', {
+    data: { text: `<p>${marker} see https://example.com/docs/page. Then (https://example.org/a_(b)), done</p><p>A <a href="https://example.net/rich">rich link</a>.</p><p>javascript:alert(1)</p>` },
+  });
+  const entry = await created.json();
+  try {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.reload();
+    const content = page.locator('.entry-card', { hasText: marker }).locator('.entry-content');
+    await expect(content).toBeVisible();
+    const icons = content.locator('a.link-open');
+    await expect(icons).toHaveCount(3);
+    expect(await icons.evaluateAll((links) => links.map((link) => [link.getAttribute('href'), link.target, link.rel]))).toEqual([
+      ['https://example.com/docs/page', '_blank', 'noopener noreferrer'],
+      ['https://example.org/a_(b)', '_blank', 'noopener noreferrer'],
+      ['https://example.net/rich', '_blank', 'noopener noreferrer'],
+    ]);
+    await expect(icons.first()).toHaveAccessibleName('Open link in a new tab');
+    await expect(content.getByRole('link', { name: 'rich link' })).toHaveAttribute('target', '_blank');
+    expect((await content.innerText()).replace(/\s+/g, ' ').trim())
+      .toBe(`${marker} see https://example.com/docs/page. Then (https://example.org/a_(b)), done A rich link. javascript:alert(1)`);
+
+    // At any width, the end of each address, its icon and the punctuation after it share one line.
+    const splits = await content.evaluate((element) => {
+      const overlap = (a, b) => a.top < b.bottom && b.top < a.bottom;
+      const textRect = (node) => { const range = document.createRange(); range.selectNodeContents(node); return range.getBoundingClientRect(); };
+      let count = 0;
+      for (let width = 140; width <= 640; width += 4) {
+        element.style.width = `${width}px`;
+        for (const tail of element.querySelectorAll('.link-tail')) {
+          const icon = tail.querySelector('.link-open').getBoundingClientRect();
+          const texts = [...tail.childNodes].filter((node) => node.nodeType === Node.TEXT_NODE);
+          if (texts.some((node) => !overlap(textRect(node), icon))) count += 1;
+        }
+      }
+      element.style.width = '';
+      return count;
+    });
+    expect(splits).toBe(0);
+  } finally {
+    await request.delete(`/api/messages/${entry.id}`);
+  }
+});
+
+test('copying an entry gives the stored entry without link icons, also through the legacy copy fallback', async ({ page, request }) => {
+  const marker = `copy-links-${Date.now()}`;
+  const entry = await (await request.post('/api/messages', { data: { text: `<p>${marker} https://example.com/x.</p>` } })).json();
+  try {
+    await page.reload();
+    const card = page.locator('.entry-card', { hasText: marker });
+    await expect(card.locator('a.link-open')).toHaveCount(1);
+
+    await page.evaluate(() => {
+      window.copiedItems = [];
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { write: async (items) => { window.copiedItems = items; } } });
+      window.ClipboardItem = class ClipboardItem { constructor(items) { this.items = items; } };
+    });
+    await card.getByRole('button', { name: 'Copy entry' }).click();
+    const modern = await page.evaluate(async () => (await window.copiedItems[0].items['text/html']).text());
+    expect(modern).toContain(marker);
+    expect(modern).not.toContain('link-open');
+
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+      window.ClipboardItem = undefined;
+      document.execCommand = (command) => {
+        if (command === 'copy') {
+          const box = document.createElement('div');
+          box.append(window.getSelection().getRangeAt(0).cloneContents());
+          window.legacyCopy = box.innerHTML;
+        }
+        return true;
+      };
+    });
+    await card.getByRole('button', { name: 'Copy entry' }).click();
+    const legacy = await page.evaluate(() => window.legacyCopy);
+    expect(legacy).toContain(marker);
+    expect(legacy).not.toContain('link-open');
+  } finally {
+    await request.delete(`/api/messages/${entry.id}`);
+  }
+});
+
+test('a file attached in the composer is sent with the entry and can be downloaded', async ({ page, request }) => {
+  const name = `notes-${Date.now()}.txt`;
+  await expect(page.locator('.file-limits')).toContainText('100 MB');
+  await page.locator('input[type="file"][multiple]').setInputFiles({ name, mimeType: 'text/plain', buffer: Buffer.from('lab notes') });
+  await expect(page.locator('.composer-file', { hasText: name })).toHaveClass(/is-done/);
+  await page.getByRole('button', { name: 'Send entry' }).click();
+  const card = page.locator('.entry-card', { hasText: name });
+  await expect(card.locator('.file-name')).toHaveText(name);
+  const download = await request.get(await card.locator('.file-name').getAttribute('href'));
+  expect(download.headers()['content-disposition']).toMatch(/^attachment;/);
+  expect(await download.text()).toBe('lab notes');
+  const id = (await card.locator('.entry-id').innerText()).replace('#', '');
+  await request.delete(`/api/messages/${id}`);
 });

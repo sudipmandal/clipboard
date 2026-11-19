@@ -14,8 +14,18 @@
           <h3><i class="bi bi-pencil-square" aria-hidden="true"></i> Save an entry</h3>
           <ul>
             <li>Paste or type in <strong>Compose</strong>, then click <strong>Send entry</strong> or press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (<kbd>⌘</kbd>+<kbd>Enter</kbd> on macOS).</li>
-            <li>Formatting and pasted images are kept (images up to 5 MB).</li>
+            <li>Formatting and pasted images are kept. Images are stored as files on the server, not inside the database.</li>
             <li>Text that looks like CLI output (prompts, configs, shell, aligned columns) is saved in <strong>monospace</strong> automatically.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h3><i class="bi bi-paperclip" aria-hidden="true"></i> Files</h3>
+          <ul>
+            <li>Drop files onto <strong>Compose</strong> or click <i class="bi bi-paperclip" aria-label="the paperclip"></i>, then send: the files are attached to the new entry, with or without text.</li>
+            <li v-if="limits">Up to <strong>{{ formatBytes(limits.maxFileBytes) }}</strong> per file and {{ limits.maxFilesPerEntry }} files per entry<template v-if="typeof limits.filesBytesUsed === 'number'">; <strong>{{ formatBytes(Math.max(0, limits.maxFilesBytes - limits.filesBytesUsed)) }}</strong> of {{ formatBytes(limits.maxFilesBytes) }} storage free</template>. The same limits are shown under the composer.</li>
+            <li>Click a file name to download it. <i class="bi bi-terminal" aria-label="The terminal button"></i> copies a <code>curl</code> command to download it on another machine.</li>
+            <li>Files are deleted together with their entry, including by automatic retention. Pinned entries keep their files.</li>
           </ul>
         </section>
 
@@ -23,7 +33,7 @@
           <h3><i class="bi bi-collection" aria-hidden="true"></i> Saved entries</h3>
           <ul>
             <li>Newest entries are on top. <strong>Auto-refresh</strong> reloads the list every 3 s so entries from other machines appear; your browser remembers the setting.</li>
-            <li><strong>Search</strong> can be used to filter for specific content.</li>
+            <li><strong>Search</strong> can be used to filter for specific content, including file names.</li>
             <li>Entries longer than about 20 lines are collapsed: use <strong>Show more</strong> / <strong>Show less</strong>.</li>
             <li v-if="retention && retention !== 'off'">Entries are deleted automatically after <strong>{{ retention }}</strong>.</li>
             <li v-else-if="retention === 'off'">Entries are kept until you delete them.</li>
@@ -36,6 +46,7 @@
             <dt><span class="chip chip-id">#12</span></dt><dd>Entry number. Click it to copy the <code>curl</code> command that prints this entry in a terminal.</dd>
             <dt><span class="chip"><i class="bi bi-terminal" aria-hidden="true"></i> Mono</span></dt><dd>Switch between monospace (CLI output) and normal text. Shared with everyone.</dd>
             <dt><span class="chip chip-icon"><i class="bi bi-pin-angle" aria-hidden="true"></i></span></dt><dd>Pin the entry: keeps it at the top and exempts it from automatic retention until it is unpinned.</dd>
+            <dt><span class="chip chip-icon"><i class="bi bi-box-arrow-up-right" aria-hidden="true"></i></span></dt><dd>Shown after every web address in an entry: opens it in a new tab. Links never replace the Clippy page.</dd>
             <dt><span class="chip chip-icon"><i class="bi bi-copy" aria-hidden="true"></i></span></dt><dd>Copy the entry: formatted for documents and mail, plain text with line breaks for terminals.</dd>
             <dt><span class="chip chip-icon chip-danger"><i class="bi bi-trash3" aria-hidden="true"></i></span></dt><dd>Delete. Click <strong>Undo</strong> in the message at the bottom within 8 s to bring it back.</dd>
           </dl>
@@ -60,9 +71,12 @@
 </template>
 
 <script>
+import { formatBytes } from '../files.mjs';
+
 export default {
   props: {
     retention: { type: String, default: '' },
+    limits: { type: Object, default: null },
   },
   data() { return { copiedLabel: '' }; },
   computed: {
@@ -72,13 +86,16 @@ export default {
     commands() {
       return [
         { label: 'Send command output', text: `some-command | curl -sk -T - ${this.apiBase}text` },
-        { label: 'Send a file', text: `curl -sk -T show-output.txt ${this.apiBase}text` },
+        { label: 'Save a text file as an entry', text: `curl -sk -T show-output.txt ${this.apiBase}text` },
+        { label: 'Attach any file (pcap, archive, …) to a new entry', text: `curl -sk -T capture.pcap ${this.apiBase}upload/` },
         { label: 'Print the newest entry', text: `curl -sk ${this.apiBase}latest.txt` },
-        { label: 'Print entry #12', text: `curl -sk ${this.apiBase}messages/12.txt` },
+        { label: 'Print entry #12 (lists its files with download links)', text: `curl -sk ${this.apiBase}messages/12.txt` },
+        { label: 'Download the first file of entry #12', text: `curl -skOJ ${this.apiBase}messages/12/files/1` },
       ];
     },
   },
   methods: {
+    formatBytes,
     open() {
       if (!this.$refs.dialog.open) this.$refs.dialog.showModal();
     },

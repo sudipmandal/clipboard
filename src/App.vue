@@ -57,6 +57,7 @@
               :created-at="message.created_at"
               :mono="Boolean(message.mono)"
               :is-pinned="Boolean(message.is_pinned)"
+              :files="message.files || []"
               @deleteMessage="deleteMessage"
               @toggleMono="toggleMono"
               @togglePin="togglePin"
@@ -94,11 +95,11 @@
             </div>
             <span class="heading-icon" aria-hidden="true"><i class="bi bi-stars"></i></span>
           </div>
-          <ChatInput @sendMessage="addMessage" />
+          <ChatInput :limits="limits" @sendMessage="addMessage" />
         </div>
       </aside>
     </section>
-    <UserGuide ref="guide" :retention="retention" />
+    <UserGuide ref="guide" :retention="retention" :limits="limits" />
     <div v-if="undoId !== null" class="undo-toast" role="status">
       <i class="bi bi-trash3" aria-hidden="true"></i>
       <span>Entry #{{ undoId }} deleted</span>
@@ -117,6 +118,13 @@ const APP_VERSION = __APP_VERSION__;
 const AUTO_REFRESH_MS = 3000;
 const AUTO_REFRESH_KEY = 'clippy.autoRefresh';
 const UNDO_TOAST_MS = 8000;
+
+// Fast 32-bit FNV-1a hash, only used to notice that an entry changed between two refreshes.
+function textHash(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return (hash >>> 0).toString(36);
+}
 
 function readAutoRefreshSetting() {
   try { return window.localStorage.getItem(AUTO_REFRESH_KEY) === '1'; } catch { return false; }
@@ -137,6 +145,7 @@ export default {
       darkMode: false,
       autoRefresh: readAutoRefreshSetting(),
       retention: '',
+      limits: null,
       undoId: null,
       searchQuery: ''
     };
@@ -149,7 +158,8 @@ export default {
       return this.messages.filter(msg => {
         const document = new DOMParser().parseFromString(msg.message, 'text/html');
         const visibleText = document.body.textContent.toLowerCase();
-        return visibleText.includes(query);
+        const fileNames = (msg.files || []).map((file) => file.name.toLowerCase()).join(' ');
+        return visibleText.includes(query) || fileNames.includes(query);
       });
     }
   },
@@ -166,8 +176,15 @@ export default {
         const response = await fetch('api/messages', { cache: 'no-store' });
         if (!response.ok) throw new Error(`Load failed (${response.status})`);
         const rows = await response.json();
-        const signature = (list) => list.map((entry) => `${entry.id}:${entry.mono ? 1 : 0}:${entry.is_pinned ? 1 : 0}`).join(',');
-        if (signature(rows) !== signature(this.messages)) this.messages = rows;
+        // Any visible change counts: text, flags and attached files (search also matches file names).
+        const signature = (list) => list.map((entry) => [
+          entry.id, entry.mono ? 1 : 0, entry.is_pinned ? 1 : 0, textHash(entry.message),
+          (entry.files || []).map((file) => `${file.id}/${file.name}/${file.size}`).join('|'),
+        ].join(':')).join('\n');
+        if (signature(rows) !== signature(this.messages)) {
+          this.messages = rows;
+          this.fetchConfig(); // storage use may have changed
+        }
       } catch (error) {
         console.error('Unable to fetch entries:', error);
       } finally {
@@ -193,6 +210,7 @@ export default {
       if (this.autoRefresh && !document.hidden) this.fetchMessages();
     },
     addMessage(message) {
+      this.fetchConfig();
       this.messages.push(message);
       this.sortMessages();
       this.scrollToTop();
@@ -250,7 +268,17 @@ export default {
     async fetchConfig() {
       try {
         const response = await fetch('api/config');
-        if (response.ok) this.retention = (await response.json()).retention || '';
+        if (!response.ok) return;
+        const config = await response.json();
+        this.retention = config.retention || '';
+        if (config.maxFileBytes) {
+          this.limits = {
+            maxFileBytes: config.maxFileBytes,
+            maxFilesBytes: config.maxFilesBytes,
+            filesBytesUsed: config.filesBytesUsed,
+            maxFilesPerEntry: config.maxFilesPerEntry,
+          };
+        }
       } catch { /* optional */ }
     },
     toggleComposer() {
@@ -289,6 +317,10 @@ export default {
         console.error('Unable to update entry:', error);
       }
     },
+    // Files dropped outside the composer would make the browser leave the page to open them.
+    preventStrayFileDrop(event) {
+      if (Array.from(event.dataTransfer?.types || []).includes('Files')) event.preventDefault();
+    },
     sortMessages() {
       this.messages.sort((a, b) => {
         if (a.is_pinned !== b.is_pinned) return a.is_pinned ? -1 : 1;
@@ -309,11 +341,15 @@ export default {
     this.fetchConfig();
     this.applyAutoRefresh();
     document.addEventListener('visibilitychange', this.onVisibilityChange);
+    window.addEventListener('dragover', this.preventStrayFileDrop);
+    window.addEventListener('drop', this.preventStrayFileDrop);
   },
   beforeUnmount() {
     window.clearInterval(this.refreshTimer);
     window.clearTimeout(this.undoTimer);
     document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    window.removeEventListener('dragover', this.preventStrayFileDrop);
+    window.removeEventListener('drop', this.preventStrayFileDrop);
   },
 };
 </script>
