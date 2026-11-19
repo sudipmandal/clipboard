@@ -164,6 +164,29 @@ class FileStore {
     return fsp.rm(this.pathFor(sha256), { force: true });
   }
 
+  async stageRemove(sha256) {
+    const source = this.pathFor(sha256);
+    const staged = path.join(this.tmpDir, `delete-${crypto.randomUUID()}`);
+    try {
+      if (!(await fsp.stat(source)).isFile()) throw Object.assign(new Error('Stored blob is not a file'), { code: 'EISDIR' });
+      await fsp.rename(source, staged);
+      return staged;
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  restoreStaged(staged, sha256) {
+    if (!staged) return Promise.resolve();
+    return fsp.rename(staged, this.pathFor(sha256));
+  }
+
+  discardStaged(staged) {
+    if (!staged) return Promise.resolve();
+    return fsp.rm(staged, { force: true });
+  }
+
   async readHead(sha256) {
     const handle = await fsp.open(this.pathFor(sha256), 'r');
     try {

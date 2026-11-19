@@ -101,6 +101,7 @@ export default {
       dragging: false,
       attachments: [],
       savedRange: null,
+      pendingCleanupClaims: [],
       tools: [
         { command: 'bold', label: 'Bold', icon: 'bi bi-type-bold' },
         { command: 'italic', label: 'Italic', icon: 'bi bi-type-italic' },
@@ -155,9 +156,9 @@ export default {
       if (!this.$refs.dropZone.contains(event.relatedTarget)) this.dragging = false;
     },
     onDrop(event) {
+      this.dragging = false;
       if (this.sending || !this.hasFiles(event)) return;
       event.preventDefault();
-      this.dragging = false;
       this.addFiles(event.dataTransfer.files);
     },
     onFilesPicked(event) {
@@ -221,7 +222,7 @@ export default {
     },
     // Uploads every blob:/data: image of the editor HTML and points it to its stored file.
     // Returns the rewritten HTML and the [{ id, token }] claims the server needs to link the images.
-    async uploadInlineImages(html) {
+    async uploadInlineImages(html, uploadedClaims = []) {
       const doc = new DOMParser().parseFromString(html, 'text/html');
       const claims = [];
       for (const image of doc.querySelectorAll('img')) {
@@ -234,7 +235,9 @@ export default {
         const name = blob.name || `pasted-image.${imageExtension(blob.type)}`;
         const stored = await uploadFile(blob, name).promise;
         image.setAttribute('src', stored.url);
-        claims.push({ id: stored.id, token: stored.token });
+        const claim = { id: stored.id, token: stored.token };
+        claims.push(claim);
+        uploadedClaims.push(claim);
       }
       return { html: doc.body.innerHTML, claims };
     },
@@ -295,7 +298,8 @@ export default {
       this.statusMessage = 'Saving entry';
       let inlineClaims = [];
       try {
-        const { html, claims } = this.hasContent ? await this.uploadInlineImages(this.message) : { html: '', claims: [] };
+        await this.cleanupClaims(this.pendingCleanupClaims);
+        const { html, claims } = this.hasContent ? await this.uploadInlineImages(this.message, inlineClaims) : { html: '', claims: [] };
         inlineClaims = claims;
         const response = await fetch('api/messages', {
           method: 'POST',
@@ -321,15 +325,26 @@ export default {
         this.inlineBlobs.clear();
         this.statusMessage = 'Entry saved';
       } catch (error) {
-        await Promise.all(inlineClaims.map(({ id, token }) => fetch(`api/files/${id}`, {
-          method: 'DELETE', headers: { 'X-Upload-Token': token },
-        }).catch(() => null)));
+        await this.cleanupClaims(inlineClaims);
         console.error('Unable to save entry:', error);
         this.errorMessage = `Not saved: ${error.message}`;
         this.statusMessage = 'Unable to save entry';
       } finally {
         this.sending = false;
       }
+    },
+    async cleanupClaims(claims) {
+      if (!claims.length) return;
+      const failed = [];
+      await Promise.all(claims.map(async ({ id, token }) => {
+        try {
+          const response = await fetch(`api/files/${id}`, { method: 'DELETE', headers: { 'X-Upload-Token': token } });
+          if (!response.ok && response.status !== 404) failed.push({ id, token });
+        } catch {
+          failed.push({ id, token });
+        }
+      }));
+      this.pendingCleanupClaims = failed;
     },
   },
 };

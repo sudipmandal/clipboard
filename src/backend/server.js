@@ -169,10 +169,20 @@ async function deletePendingUpload(id, token) {
   return enqueueWrite(async () => {
     const row = await get('SELECT sha256, claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
     if (!row || !tokenMatches(row.claim_hash, token)) return false;
-    await inTransaction(() => run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]));
-    if (!(await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? LIMIT 1', [row.sha256]))) {
-      await fileStore.remove(row.sha256);
+    let staged = null;
+    await run('BEGIN IMMEDIATE');
+    try {
+      await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+      if (!(await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? LIMIT 1', [row.sha256]))) {
+        staged = await fileStore.stageRemove(row.sha256);
+      }
+      await run('COMMIT');
+    } catch (error) {
+      await run('ROLLBACK').catch(() => {});
+      await fileStore.restoreStaged(staged, row.sha256).catch(() => {});
+      throw error;
     }
+    await fileStore.discardStaged(staged).catch(() => {});
     return true;
   });
 }
@@ -276,6 +286,8 @@ async function writeEntry(html, mono, attachments, inlineUploads) {
   const result = await run('INSERT INTO messages (message, mono) VALUES (?, ?)', [html, mono ? 1 : 0]);
   const linkedHtml = await linkFiles(result.lastID, html, attachments, inlineUploads);
   if (linkedHtml !== html) await run('UPDATE messages SET message = ? WHERE id = ?', [linkedHtml, result.lastID]);
+  const linked = await get('SELECT COUNT(*) AS n FROM attachments WHERE message_id = ?', [result.lastID]);
+  if (linked.n > MAX_FILES_PER_ENTRY) throw httpError(400, `At most ${MAX_FILES_PER_ENTRY} files per entry`);
   return result.lastID;
 }
 

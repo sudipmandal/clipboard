@@ -93,12 +93,14 @@ test('Accessibility Insights automated checks find no WCAG A/AA violations', asy
 });
 
 test('Accessibility Insights tab-stop check has logical focus order and no traps', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.reload();
   const names = [];
-  for (let index = 0; index < 30; index += 1) {
+  for (let index = 0; index < 200; index += 1) {
     await page.keyboard.press('Tab');
     const name = await page.evaluate(() => document.activeElement?.getAttribute('aria-label') || document.activeElement?.textContent?.trim() || document.activeElement?.className);
     names.push(name);
-    if (name === 'Send entry') break;
+    if (names.includes('Collapse composer') && names.includes('Rich text editor') && names.includes('Bold')) break;
   }
   expect(names[0]).toContain('Skip to saved entries');
   expect(names).toContain('Collapse composer');

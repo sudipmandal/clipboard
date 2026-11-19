@@ -35,6 +35,9 @@ async function upload(baseURL, name, body, type = 'image/png') {
   const response = await fetch(`${baseURL}/api/files/${encodeURIComponent(name)}`, { method: 'PUT', headers: { 'content-type': type }, body });
   return { response, file: await response.json() };
 }
+async function postEntry(baseURL, body) {
+  return fetch(`${baseURL}/api/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+}
 function storedFiles(root) {
   const filesRoot = path.join(root, 'files');
   if (!existsSync(filesRoot)) return [];
@@ -47,20 +50,32 @@ function rowCount(root, sql) {
 const claims = (files) => files.map(({ id, token }) => ({ id, token }));
 
 // B1
-test('MAX_FILES_PER_ENTRY counts inline and regular claims together', async () => {
+ test('MAX_FILES_PER_ENTRY counts inline and regular claims together', async () => {
   const server = await startServer({ MAX_FILES_PER_ENTRY: '2' });
   try {
     const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
     const files = [];
     for (let index = 0; index < 3; index += 1) files.push((await upload(server.baseURL, `i-${index}.png`, Buffer.concat([png, Buffer.from([index])]))).file);
-    const response = await fetch(`${server.baseURL}/api/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: files.map((f) => `<img src="${f.url}">`).join(''), inlineUploads: claims(files) }) });
+    const response = await postEntry(server.baseURL, { text: files.map((f) => `<img src="${f.url}">`).join(''), inlineUploads: claims(files) });
     assert.equal(response.status, 400);
     assert.equal(rowCount(server.root, 'SELECT COUNT(*) AS n FROM messages'), 0);
   } finally { await stopServer(server); }
 });
 
+test('MAX_FILES_PER_ENTRY counts copied inline rows created during linking', async () => {
+  const server = await startServer({ MAX_FILES_PER_ENTRY: '1' });
+  try {
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    const source = (await upload(server.baseURL, 'source.png', png)).file;
+    const seeded = await (await postEntry(server.baseURL, { text: `<img src="${source.url}">`, inlineUploads: claims([source]) })).json();
+    const regular = (await upload(server.baseURL, 'one.txt', Buffer.from('one'), 'text/plain')).file;
+    const response = await postEntry(server.baseURL, { text: seeded.message, attachments: claims([regular]) });
+    assert.equal(response.status, 400);
+  } finally { await stopServer(server); }
+});
+
 // B2
-test('deleting pending uploads removes unreferenced blobs immediately', async () => {
+ test('deleting pending uploads removes unreferenced blobs immediately', async () => {
   const server = await startServer({ MAX_FILES_BYTES: '100000' });
   try {
     for (let index = 0; index < 3; index += 1) {
@@ -71,20 +86,35 @@ test('deleting pending uploads removes unreferenced blobs immediately', async ()
   } finally { await stopServer(server); }
 });
 
-// B5
-// The UI calls this token-authenticated deletion on entry failure; server must reclaim the blob immediately.
+test('failed blob removal keeps pending metadata and token retryable', async () => {
+  const server = await startServer();
+  try {
+    const { file } = await upload(server.baseURL, 'retry.bin', Buffer.from('retry'), 'application/octet-stream');
+    const [sha] = storedFiles(server.root);
+    const blob = path.join(server.root, 'files', sha.slice(0, 2), sha);
+    rmSync(blob);
+    mkdirSync(blob);
+    const failed = await fetch(`${server.baseURL}/api/files/${file.id}`, { method: 'DELETE', headers: { 'x-upload-token': file.token } });
+    assert.equal(failed.status, 500);
+    assert.equal(rowCount(server.root, 'SELECT COUNT(*) AS n FROM attachments WHERE message_id IS NULL'), 1);
+    rmSync(blob, { recursive: true });
+    assert.equal((await fetch(`${server.baseURL}/api/files/${file.id}`, { method: 'DELETE', headers: { 'x-upload-token': file.token } })).status, 204);
+  } finally { await stopServer(server); }
+});
+
+// B5 server half: token-authenticated delete must reclaim physical quota.
 test('failed-save inline claim can be discarded without quota residue', async () => {
   const server = await startServer({ MAX_ENTRY_BYTES: '1000' });
   try {
     const { file } = await upload(server.baseURL, 'failed.png', Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'));
-    const failed = await fetch(`${server.baseURL}/api/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: 'x'.repeat(2000), inlineUploads: claims([file]) }) });
-    assert.equal(failed.status, 413);
+    assert.equal((await postEntry(server.baseURL, { text: 'x'.repeat(2000), inlineUploads: claims([file]) })).status, 413);
     assert.equal((await fetch(`${server.baseURL}/api/files/${file.id}`, { method: 'DELETE', headers: { 'x-upload-token': file.token } })).status, 204);
     assert.deepEqual(storedFiles(server.root), []);
   } finally { await stopServer(server); }
 });
 
 // B6
-test('adjacent URLs separated by prose delimiters are distinct', () => {
+test('adjacent URLs split without truncating a valid pipe inside one URL', () => {
   assert.deepEqual(findUrls('https://first.example/a|https://second.example/b').map((item) => item.url), ['https://first.example/a', 'https://second.example/b']);
+  assert.deepEqual(findUrls('https://example.org/search?filters=red|green').map((item) => item.url), ['https://example.org/search?filters=red|green']);
 });
