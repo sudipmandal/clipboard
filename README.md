@@ -145,9 +145,9 @@ Traefik does not limit request body size by default. With nginx, raise `client_m
 
 ## Release
 
-Current application version: **1.6.0**. This release adds disk-backed file attachments and pasted-image storage, safe new-tab controls for web addresses, filename-aware search and refresh, and reliable cleanup for soft-deleted entries. Pending uploads use private claim tokens, image content is validated before inline display, and file/database writes are failure-safe.
+Current application version: **1.6.1**. This hotfix enforces file-count and physical-storage limits across attached and inline files, prevents composer changes or failed files from being silently discarded during save, cleans failed inline uploads immediately, and separates adjacent web addresses correctly.
 
-Pushing a semantic-version tag such as `v1.6.0` starts the GitHub Actions workflow. The tag build publishes the multi-architecture Docker image and creates a GitHub Release with generated release notes. GitHub automatically provides source-code archives in `.zip` and `.tar.gz` formats for the tag.
+Pushing a semantic-version tag such as `v1.6.1` starts the GitHub Actions workflow. The tag build publishes the multi-architecture Docker image and creates a GitHub Release with generated release notes. GitHub automatically provides source-code archives in `.zip` and `.tar.gz` formats for the tag.
 
 ## Security
 

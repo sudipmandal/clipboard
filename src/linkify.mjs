@@ -1,7 +1,9 @@
 // Display-only link helpers: a small ↗ icon after every web address so it opens in a new tab.
 // The stored entry is never changed, so copying an entry still gives exactly what was pasted.
 
-const URL_CANDIDATE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
+// Common prose separators are not part of a URL. Keep URL path/query punctuation such as
+// `?`, `&`, `=`, parentheses and brackets, but split addresses joined by pipes or backslashes.
+const URL_CANDIDATE = /\bhttps?:\/\/[^\s<>"'`|\\]+/gi;
 const CLOSERS = { ')': '(', ']': '[', '}': '{' };
 
 function count(text, char) {

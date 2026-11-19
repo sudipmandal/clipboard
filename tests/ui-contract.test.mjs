@@ -22,7 +22,7 @@ test('desktop workspace exposes saved entries beside a collapsible composer', ()
 test('version is sourced from package metadata and shown as a badge', () => {
   assert.match(app, /APP_VERSION/);
   assert.match(app, /version-badge/);
-  assert.equal(pkg.version, '1.6.0');
+  assert.equal(pkg.version, '1.6.1');
 });
 
 test('composer is a full-height flex column with a bottom action', () => {
@@ -74,7 +74,7 @@ test('vulnerable Quill packages and runtime are removed', () => {
 
 test('native rich editor has an accessible toolbar and live status', () => {
   assert.match(input, /role="toolbar"/);
-  assert.match(input, /contenteditable="true"/);
+  assert.match(input, /:contenteditable="!sending"/);
   assert.match(input, /aria-label="Rich text editor"/);
   assert.match(input, /aria-live="polite"/);
   assert.match(input, /@click="applyFormat\(tool\)"/);

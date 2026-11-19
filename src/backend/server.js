@@ -165,6 +165,18 @@ async function verifyClaims(claims) {
   }
 }
 
+async function deletePendingUpload(id, token) {
+  return enqueueWrite(async () => {
+    const row = await get('SELECT sha256, claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+    if (!row || !tokenMatches(row.claim_hash, token)) return false;
+    await inTransaction(() => run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]));
+    if (!(await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? LIMIT 1', [row.sha256]))) {
+      await fileStore.remove(row.sha256);
+    }
+    return true;
+  });
+}
+
 function enqueueWrite(task) {
   const queued = writeQueue.then(task);
   writeQueue = queued.catch(() => {});
@@ -270,7 +282,8 @@ async function writeEntry(html, mono, attachments, inlineUploads) {
 // Validates, then writes the entry and links its files in one transaction. Returns { status, entry } or { status, error }.
 async function insertEntry(html, mono, attachments = [], inlineUploads = []) {
   if (!html.trim() && !attachments.length) return { status: 400, error: 'Entry content is required' };
-  if (attachments.length > MAX_FILES_PER_ENTRY) return { status: 400, error: `At most ${MAX_FILES_PER_ENTRY} files per entry` };
+  const claimedFiles = new Set([...attachments, ...inlineUploads].map((claim) => claim.id));
+  if (claimedFiles.size > MAX_FILES_PER_ENTRY) return { status: 400, error: `At most ${MAX_FILES_PER_ENTRY} files per entry` };
   if (Buffer.byteLength(html, 'utf8') > MAX_ENTRY_BYTES) return { status: 413, error: 'Entry is too large' };
   if (hasOversizedImage(html)) return { status: 413, error: 'An embedded image is too large' };
   try {
@@ -495,10 +508,9 @@ app.get('/api/messages/:id/files/:index', async (req, res) => {
 app.delete('/api/files/:id', async (req, res) => {
   const id = entryId(req.params.id);
   if (id === null) return res.status(404).json({ error: 'File not found' });
-  const row = await get('SELECT claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
-  if (!row || !tokenMatches(row.claim_hash, req.get('x-upload-token'))) return res.status(404).json({ error: 'File not found' });
-  await enqueueWrite(() => run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]));
-  return res.status(204).send();
+  return (await deletePendingUpload(id, req.get('x-upload-token')))
+    ? res.status(204).send()
+    : res.status(404).json({ error: 'File not found' });
 });
 
 app.use(express.json({ limit: MAX_ENTRY_BYTES }));

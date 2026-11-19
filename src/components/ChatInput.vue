@@ -10,29 +10,29 @@
       @drop="onDrop"
     >
       <div class="editor-toolbar" role="toolbar" aria-label="Text formatting">
-        <button v-for="tool in tools" :key="tool.command" class="tool-button" type="button" :aria-label="tool.label" :title="tool.label" @click="applyFormat(tool)">
+        <button v-for="tool in tools" :key="tool.command" class="tool-button" type="button" :disabled="sending" :aria-label="tool.label" :title="tool.label" @click="applyFormat(tool)">
           <i :class="tool.icon" aria-hidden="true"></i>
         </button>
         <span class="toolbar-divider" aria-hidden="true"></span>
-        <button class="tool-button" type="button" aria-label="Insert link" title="Insert link" @click="insertLink">
+        <button class="tool-button" type="button" :disabled="sending" aria-label="Insert link" title="Insert link" @click="insertLink">
           <i class="bi bi-link-45deg" aria-hidden="true"></i>
         </button>
-        <button class="tool-button" type="button" aria-label="Insert image" title="Insert image" @click="openImagePicker">
+        <button class="tool-button" type="button" :disabled="sending" aria-label="Insert image" title="Insert image" @click="openImagePicker">
           <i class="bi bi-image" aria-hidden="true"></i>
         </button>
-        <button class="tool-button" type="button" aria-label="Attach files" title="Attach files" @click="$refs.fileInput.click()">
+        <button class="tool-button" type="button" :disabled="sending" aria-label="Attach files" title="Attach files" @click="$refs.fileInput.click()">
           <i class="bi bi-paperclip" aria-hidden="true"></i>
         </button>
-        <button class="tool-button" type="button" aria-label="Clear formatting" title="Clear formatting" @click="applyFormat({ command: 'removeFormat' })">
+        <button class="tool-button" type="button" :disabled="sending" aria-label="Clear formatting" title="Clear formatting" @click="applyFormat({ command: 'removeFormat' })">
           <i class="bi bi-eraser" aria-hidden="true"></i>
         </button>
-        <input ref="imageInput" class="visually-hidden" type="file" accept="image/*" tabindex="-1" aria-hidden="true" @change="insertImage">
-        <input ref="fileInput" class="visually-hidden" type="file" multiple tabindex="-1" aria-hidden="true" @change="onFilesPicked">
+        <input ref="imageInput" class="visually-hidden" type="file" accept="image/*" :disabled="sending" tabindex="-1" aria-hidden="true" @change="insertImage">
+        <input ref="fileInput" class="visually-hidden" type="file" multiple :disabled="sending" tabindex="-1" aria-hidden="true" @change="onFilesPicked">
       </div>
       <div
         ref="editor"
         class="rich-editor"
-        contenteditable="true"
+        :contenteditable="!sending"
         role="textbox"
         aria-label="Rich text editor"
         aria-multiline="true"
@@ -58,7 +58,7 @@
         <span v-if="item.status === 'uploading'" class="composer-file-progress" role="progressbar" :aria-valuenow="Math.round(item.progress * 100)" aria-valuemin="0" aria-valuemax="100" :aria-label="`Uploading ${item.name}`">
           <span :style="{ width: `${Math.round(item.progress * 100)}%` }"></span>
         </span>
-        <button class="composer-file-remove" type="button" :aria-label="`Remove ${item.name}`" @click="removeAttachment(item)">
+        <button class="composer-file-remove" type="button" :disabled="sending" :aria-label="`Remove ${item.name}`" @click="removeAttachment(item)">
           <i class="bi bi-x-lg" aria-hidden="true"></i>
         </button>
       </li>
@@ -121,8 +121,11 @@ export default {
     readyAttachments() {
       return this.attachments.filter((item) => item.status === 'done');
     },
+    hasAttachmentErrors() {
+      return this.attachments.some((item) => item.status === 'error');
+    },
     canSend() {
-      return !this.sending && !this.uploading && (this.hasContent || this.readyAttachments.length > 0);
+      return !this.sending && !this.uploading && !this.hasAttachmentErrors && (this.hasContent || this.readyAttachments.length > 0);
     },
     storageFree() {
       if (!this.limits || typeof this.limits.filesBytesUsed !== 'number') return null;
@@ -152,7 +155,7 @@ export default {
       if (!this.$refs.dropZone.contains(event.relatedTarget)) this.dragging = false;
     },
     onDrop(event) {
-      if (!this.hasFiles(event)) return;
+      if (this.sending || !this.hasFiles(event)) return;
       event.preventDefault();
       this.dragging = false;
       this.addFiles(event.dataTransfer.files);
@@ -162,6 +165,7 @@ export default {
       event.target.value = '';
     },
     addFiles(fileList) {
+      if (this.sending) return;
       this.errorMessage = '';
       const maxFile = this.limits?.maxFileBytes ?? Infinity;
       const maxCount = this.limits?.maxFilesPerEntry ?? Infinity;
@@ -289,8 +293,10 @@ export default {
       this.sending = true;
       this.errorMessage = '';
       this.statusMessage = 'Saving entry';
+      let inlineClaims = [];
       try {
         const { html, claims } = this.hasContent ? await this.uploadInlineImages(this.message) : { html: '', claims: [] };
+        inlineClaims = claims;
         const response = await fetch('api/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -315,6 +321,9 @@ export default {
         this.inlineBlobs.clear();
         this.statusMessage = 'Entry saved';
       } catch (error) {
+        await Promise.all(inlineClaims.map(({ id, token }) => fetch(`api/files/${id}`, {
+          method: 'DELETE', headers: { 'X-Upload-Token': token },
+        }).catch(() => null)));
         console.error('Unable to save entry:', error);
         this.errorMessage = `Not saved: ${error.message}`;
         this.statusMessage = 'Unable to save entry';

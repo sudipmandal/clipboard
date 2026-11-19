@@ -1,13 +1,13 @@
 {
   "name": "clipboard",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "private": true,
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "serve": "vite preview",
-    "test": "node --test tests/ui-contract.test.mjs tests/backend-limits.test.mjs",
-    "test:e2e": "playwright test",
+    "test": "node --test tests/ui-contract.test.mjs tests/backend-limits.test.mjs tests/hotfix-regressions.test.mjs",
+    "test:e2e": "playwright test tests/e2e.spec.mjs tests/hotfix-regressions.spec.mjs",
     "test:a11y": "playwright test --grep accessibility"
   },
   "dependencies": {

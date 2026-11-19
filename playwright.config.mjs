@@ -4,7 +4,7 @@ const baseURL = process.env.BASE_URL || 'http://127.0.0.1:4173';
 
 export default defineConfig({
   testDir: './tests',
-  testMatch: '**/e2e.spec.mjs',
+  testMatch: ['**/e2e.spec.mjs', '**/hotfix-regressions.spec.mjs'],
   timeout: 30_000,
   retries: 0,
   use: {
