@@ -149,6 +149,7 @@ export default {
     onDragOver(event) {
       if (!this.hasFiles(event)) return; // keep normal text drag-and-drop inside the editor
       event.preventDefault();
+      if (this.sending) { this.dragging = false; return; }
       event.dataTransfer.dropEffect = 'copy';
       this.dragging = true;
     },

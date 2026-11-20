@@ -127,6 +127,11 @@ test('file drop during save clears the drag overlay', async ({ page }) => {
     const transfer = new DataTransfer();
     transfer.items.add(new File(['x'], 'x.txt', { type: 'text/plain' }));
     element.dispatchEvent(new DragEvent('dragenter', { bubbles: true, dataTransfer: transfer }));
+  });
+  await expect(page.locator('.drop-overlay')).toHaveCount(0);
+  await page.locator('.composer-editor').evaluate((element) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(['x'], 'x.txt', { type: 'text/plain' }));
     element.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
   });
   await expect(page.locator('.drop-overlay')).toHaveCount(0);

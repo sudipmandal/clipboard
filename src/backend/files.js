@@ -168,6 +168,17 @@ class FileStore {
     }
   }
 
+  async tmpBytes(exclude = null) {
+    let total = 0;
+    for (const file of await fsp.readdir(this.tmpDir)) {
+      const full = path.join(this.tmpDir, file);
+      if (exclude && path.resolve(full) === path.resolve(exclude)) continue;
+      const stat = await fsp.stat(full);
+      if (stat.isFile()) total += stat.size;
+    }
+    return total;
+  }
+
   // Moves an upload into place; if the same content is already stored, the upload is simply dropped.
   async commit(tmp, sha256, size) {
     const target = this.pathFor(sha256);

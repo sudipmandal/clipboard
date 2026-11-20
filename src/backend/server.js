@@ -177,11 +177,19 @@ async function verifyClaims(claims) {
 }
 
 async function finishDeletionIntent(sha256) {
-  if (await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? AND message_id IS NOT NULL LIMIT 1', [sha256])) {
+  const owners = await all('SELECT id, message_id, size FROM attachments WHERE sha256 = ?', [sha256]);
+  if (owners.some((row) => row.message_id !== null)) {
     await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
     return false;
   }
-  await inTransaction(() => run('DELETE FROM attachments WHERE sha256 = ? AND message_id IS NULL', [sha256]));
+  if (owners.length) {
+    const expectedSize = Math.max(...owners.map((row) => row.size));
+    if (await fileStore.isRegularFile(sha256, expectedSize)) {
+      await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
+      return false;
+    }
+    await inTransaction(() => run('DELETE FROM attachments WHERE sha256 = ? AND message_id IS NULL', [sha256]));
+  }
   await fileStore.remove(sha256);
   await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
   return true;
@@ -262,20 +270,20 @@ async function loadEntry(id) {
 }
 
 // Each distinct file is counted once, whatever the number of entries pointing to it.
-async function filesBytesUsed() {
+async function filesBytesUsed(excludeTmp = null) {
   const rows = await all('SELECT sha256, size FROM attachments UNION ALL SELECT sha256, size FROM file_deletions');
   const bytesByHash = new Map();
   for (const { sha256, size } of [...rows, ...await fileStore.listStored()]) {
     bytesByHash.set(sha256, Math.max(bytesByHash.get(sha256) || 0, size));
   }
-  return [...bytesByHash.values()].reduce((total, size) => total + size, 0);
+  return [...bytesByHash.values()].reduce((total, size) => total + size, 0) + await fileStore.tmpBytes(excludeTmp);
 }
 
-async function fileBytesCharged(sha256) {
+async function fileMetadataCharge(sha256) {
   const row = await get(`SELECT COALESCE(MAX(size), 0) AS size FROM (
     SELECT size FROM attachments WHERE sha256 = ? UNION ALL SELECT size FROM file_deletions WHERE sha256 = ?
   )`, [sha256, sha256]);
-  return Math.max(row.size, await fileStore.storedSize(sha256));
+  return row.size;
 }
 
 // <img src="api/files/<id>/…"> (relative or absolute) inside entry HTML.
@@ -299,6 +307,9 @@ async function linkFiles(messageId, html, attachments, inlineUploads) {
       await run('UPDATE attachments SET message_id = ?, inline = 1, claim_hash = NULL WHERE id = ?', [messageId, row.id]);
       remap.set(fileId, row);
     } else if (row.message_id !== messageId) {
+      if (!(await fileStore.isRegularFile(row.sha256, row.size))) {
+        throw httpError(409, 'An inline image is no longer available, paste it again');
+      }
       const copy = await run(
         'INSERT INTO attachments (message_id, sha256, name, type, size, inline) VALUES (?, ?, ?, ?, ?, 1)',
         [messageId, row.sha256, row.name, row.type, row.size],
@@ -361,22 +372,24 @@ function purgeExpired() {
     let removed = 0;
     await inTransaction(async () => {
       await run('CREATE TEMP TABLE IF NOT EXISTS purge_attachments (id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)');
+      await run('CREATE TEMP TABLE IF NOT EXISTS purge_messages (id INTEGER PRIMARY KEY)');
       await run('DELETE FROM purge_attachments');
+      await run('DELETE FROM purge_messages');
       const retentionClause = RETENTION_SECONDS > 0
         ? "(m.created_at < datetime('now', ?) AND m.is_pinned = 0) OR "
         : '';
       const retentionParams = RETENTION_SECONDS > 0 ? [`-${RETENTION_SECONDS} seconds`] : [];
+      await run(`INSERT INTO purge_messages (id)
+        SELECT m.id FROM messages m WHERE ${retentionClause}(m.deleted_at IS NOT NULL AND julianday(m.deleted_at) < julianday('now', ?))`, [
+        ...retentionParams, `-${DELETED_ENTRY_PURGE_SECONDS} seconds`,
+      ]);
       await run(`INSERT INTO purge_attachments (id, sha256, size)
         SELECT a.id, a.sha256, a.size FROM attachments a
-        WHERE a.message_id IN (
-          SELECT m.id FROM messages m WHERE ${retentionClause}(m.deleted_at IS NOT NULL AND julianday(m.deleted_at) < julianday('now', ?))
-        ) OR (a.message_id IS NULL AND julianday(a.created_at) < julianday('now', ?))`, [
-        ...retentionParams, `-${DELETED_ENTRY_PURGE_SECONDS} seconds`, `-${PENDING_UPLOAD_SECONDS} seconds`,
+        WHERE a.message_id IN (SELECT id FROM purge_messages)
+          OR (a.message_id IS NULL AND julianday(a.created_at) < julianday('now', ?))`, [
+        `-${PENDING_UPLOAD_SECONDS} seconds`,
       ]);
-      if (RETENTION_SECONDS > 0) {
-        removed += (await run("DELETE FROM messages WHERE created_at < datetime('now', ?) AND is_pinned = 0", [`-${RETENTION_SECONDS} seconds`])).changes;
-      }
-      removed += (await run("DELETE FROM messages WHERE deleted_at IS NOT NULL AND julianday(deleted_at) < julianday('now', ?)", [`-${DELETED_ENTRY_PURGE_SECONDS} seconds`])).changes;
+      removed += (await run('DELETE FROM messages WHERE id IN (SELECT id FROM purge_messages)')).changes;
       await run('DELETE FROM attachments WHERE id IN (SELECT id FROM purge_attachments)');
       await run(`INSERT OR IGNORE INTO file_deletions (sha256, size)
         SELECT p.sha256, MAX(p.size) FROM purge_attachments p
@@ -499,9 +512,10 @@ function storeUpload({ upload, name, type }, createEntry) {
         await finishDeletionIntent(upload.sha256);
       }
       return await inTransaction(async () => {
-        const used = await filesBytesUsed();
-        const increase = Math.max(0, upload.size - await fileBytesCharged(upload.sha256));
-        if (used + increase > MAX_FILES_BYTES) {
+        const used = await filesBytesUsed(upload.tmp);
+        const currentCharge = Math.max(await fileMetadataCharge(upload.sha256), await fileStore.storedSize(upload.sha256));
+        const projectedCharge = Math.max(await fileMetadataCharge(upload.sha256), upload.size);
+        if (used - currentCharge + projectedCharge > MAX_FILES_BYTES) {
           throw httpError(413, `File storage is full (${formatBytes(MAX_FILES_BYTES)})`);
         }
         const messageId = createEntry ? await writeEntry('', false, [], []) : null;
@@ -514,7 +528,7 @@ function storeUpload({ upload, name, type }, createEntry) {
         return { id: row.lastID, token, messageId, name, type, size: upload.size, url: fileUrl(row.lastID, name) };
       });
     } catch (error) {
-      await fileStore.discard(upload.tmp);
+      try { await fileStore.discard(upload.tmp); } catch (cleanupError) { console.error('Temporary upload cleanup deferred:', cleanupError.message); }
       if (added && !(await get('SELECT 1 AS found FROM attachments WHERE sha256 = ?', [upload.sha256]))) {
         await run('INSERT OR IGNORE INTO file_deletions (sha256, size) VALUES (?, ?)', [upload.sha256, upload.size]);
         try { await finishDeletionIntent(upload.sha256); } catch (cleanupError) { console.error('Uploaded file cleanup deferred:', cleanupError.message); }
