@@ -80,6 +80,7 @@ class FileStore {
   constructor(root) {
     this.root = path.resolve(root); // res.sendFile needs absolute paths
     this.tmpDir = path.join(root, '.tmp');
+    this.reservations = new Map(); // tmp path -> maximum writable bytes until commit or discard
   }
 
   async init() {
@@ -92,10 +93,24 @@ class FileStore {
     return path.join(this.root, sha256.slice(0, 2), sha256);
   }
 
-  // Streams the request body to a temporary file while hashing it. Rejects with status 413 past maxBytes.
-  receive(req, maxBytes) {
+  // Called on the server's write queue, like commit and discard. Unowned temps
+  // (including failed unlinks) consume headroom; count owned paths by reservation.
+  async reserve(declared, headroom) {
+    let available = headroom - await this.tmpBytes(this.reservations);
+    for (const bytes of this.reservations.values()) available -= bytes;
+    const limitError = this.reservations.size ? httpError(503, 'Upload staging is busy; retry later')
+      : httpError(413, 'Upload exceeds available staging space');
+    if (declared > available || (available <= 0 && declared !== 0)) throw limitError;
+    const maxBytes = Number.isFinite(declared) ? declared : available;
     const tmp = path.join(this.tmpDir, crypto.randomUUID());
+    this.reservations.set(tmp, maxBytes);
+    return { tmp, maxBytes, limitError };
+  }
+
+  // Stream outside the write queue, enforcing the reservation on actual bytes.
+  receive(req, { tmp, maxBytes, limitError }) {
     return new Promise((resolve, reject) => {
+      if (req.destroyed) return reject(httpError(400, 'Upload interrupted'));
       const hash = crypto.createHash('sha256');
       const out = fs.createWriteStream(tmp, { flags: 'wx' });
       const headChunks = [];
@@ -106,15 +121,15 @@ class FileStore {
         if (settled) return;
         settled = true;
         req.unpipe(out);
-        // remove the partial file only once the stream has closed (it may still be opening)
-        out.once('close', () => fsp.rm(tmp, { force: true }).catch(() => {}));
+        // Keep the reservation until the writer has closed and discard has run.
+        out.once('close', () => reject(error));
         out.destroy();
-        reject(error);
       };
       req.on('data', (chunk) => {
+        if (settled) return;
         size += chunk.length;
         if (size > maxBytes) {
-          fail(httpError(413, 'File is too large'));
+          fail(limitError);
           return;
         }
         hash.update(chunk);
@@ -180,7 +195,7 @@ class FileStore {
     let total = 0;
     for (const file of await fsp.readdir(this.tmpDir)) {
       const full = path.join(this.tmpDir, file);
-      if (exclude && path.resolve(full) === path.resolve(exclude)) continue;
+      if (exclude?.has(full)) continue;
       const stat = await fsp.stat(full);
       if (!stat.isFile()) throw new Error('Temp inventory contains a non-regular file');
       total += stat.size;
@@ -192,8 +207,12 @@ class FileStore {
   async commit(tmp, sha256, size) {
     const target = this.pathFor(sha256);
     if (await this.isRegularFile(sha256, size)) {
-      await fsp.rm(tmp, { force: true });
-      return false;
+      const existing = crypto.createHash('sha256');
+      for await (const chunk of fs.createReadStream(target)) existing.update(chunk);
+      if (existing.digest('hex') === sha256) {
+        await fsp.rm(tmp, { force: true });
+        return false;
+      }
     }
     await fsp.mkdir(path.dirname(target), { recursive: true });
     await fsp.rename(tmp, target);
@@ -264,6 +283,7 @@ class FileStore {
     const files = await fsp.readdir(this.tmpDir).catch(() => []);
     for (const file of files) {
       const full = path.join(this.tmpDir, file);
+      if (this.reservations.has(full)) continue;
       try {
         const stat = await fsp.stat(full);
         if (now - stat.mtimeMs >= maxAgeMs) await fsp.rm(full, { force: true });

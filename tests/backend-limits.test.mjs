@@ -465,7 +465,9 @@ test('a file that only claims to be an image is never served inline', async () =
   try {
     const fake = await (await upload(server.baseURL, 'fake.png', Buffer.from('<svg onload="alert(1)"></svg>'), { type: 'image/png' })).json();
     assert.equal(fake.type, 'application/octet-stream');
-    const entry = await (await postEntry(server.baseURL, `<img src="${fake.url}">`, [fake], [fake])).json();
+    const text = `<img src="${fake.url}">`;
+    assert.equal((await postEntry(server.baseURL, text, [fake], [fake])).status, 409);
+    const entry = await (await postEntry(server.baseURL, text, [fake])).json();
     assert.equal(entry.files.length, 1);
     const served = await fetch(`${server.baseURL}/${fake.url}`);
     assert.equal(served.headers.get('content-type'), 'application/octet-stream');

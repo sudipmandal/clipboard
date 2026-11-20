@@ -305,7 +305,7 @@ async function linkFiles(messageId, html, attachments, inlineUploads, baseUrl) {
   for (const { id } of attachments) {
     await run('UPDATE attachments SET message_id = ?, inline = 0, claim_hash = NULL WHERE id = ? AND message_id IS NULL', [messageId, id]);
   }
-  const claimedInline = new Set(inlineUploads.map((claim) => claim.id));
+  const unlinkedInline = new Set(inlineUploads.map((claim) => claim.id));
   const base = baseUrl && URL.parse(baseUrl);
   const localSources = new Map();
   if (base) {
@@ -321,8 +321,9 @@ async function linkFiles(messageId, html, attachments, inlineUploads, baseUrl) {
     if (!row) throw httpError(409, 'An inline image is no longer available, paste it again');
     if (!isInlineImageType(row.type)) continue;
     if (row.message_id === null) {
-      if (!claimedInline.has(fileId)) continue;
+      if (!unlinkedInline.has(fileId)) continue;
       await run('UPDATE attachments SET message_id = ?, inline = 1, claim_hash = NULL WHERE id = ?', [messageId, row.id]);
+      unlinkedInline.delete(fileId);
       remap.set(fileId, row);
     } else if (row.message_id !== messageId) {
       if (!(await fileStore.isRegularFile(row.sha256, row.size))) {
@@ -335,6 +336,7 @@ async function linkFiles(messageId, html, attachments, inlineUploads, baseUrl) {
       remap.set(fileId, { ...row, id: copy.lastID });
     }
   }
+  if (unlinkedInline.size) throw httpError(409, 'An inline upload does not match an inline image in this entry');
   if (!remap.size) return html;
   return html.replace(INLINE_FILE_SRC, (match, prefix, doubleQuoted, singleQuoted, unquoted) => {
     const row = remap.get(localSources.get(doubleQuoted ?? singleQuoted ?? unquoted));
@@ -405,6 +407,7 @@ function purgeExpired() {
       await run(`INSERT INTO purge_attachments (id, sha256, size)
         SELECT a.id, a.sha256, a.size FROM attachments a
         WHERE a.message_id IN (SELECT id FROM purge_messages)
+          OR (a.message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = a.message_id))
           OR (a.message_id IS NULL AND julianday(a.created_at) < julianday('now', ?))`, [
         `-${PENDING_UPLOAD_SECONDS} seconds`,
       ]);
@@ -508,15 +511,22 @@ async function receiveUpload(req) {
   const name = sanitizeFileName(req.params.name);
   const declared = Number.parseInt(req.headers['content-length'], 10);
   if (declared > MAX_FILE_BYTES) throw httpError(413, `File is larger than the ${formatBytes(MAX_FILE_BYTES)} limit`);
-  // The total-storage check happens after hashing: an identical file already stored takes no extra space.
-  let upload;
+  // The hash isn't known yet. Allow one admissible file's worth of staging
+  // across both PUT routes, independently of the post-hash retained quota.
+  const stage = await enqueueWrite(() => fileStore.reserve(declared, Math.min(MAX_FILE_BYTES, MAX_FILES_BYTES)));
+  if (stage.maxBytes === MAX_FILE_BYTES) stage.limitError = httpError(413, `File is larger than the ${formatBytes(MAX_FILE_BYTES)} limit`);
   try {
-    upload = await fileStore.receive(req, MAX_FILE_BYTES);
+    const upload = await fileStore.receive(req, stage);
+    return { upload, name, type: resolveType(name, req.headers['content-type'], upload.head) };
   } catch (error) {
-    if (error.status === 413) throw httpError(413, `File is larger than the ${formatBytes(MAX_FILE_BYTES)} limit`);
+    await enqueueWrite(() => discardUpload(stage.tmp));
     throw error;
   }
-  return { upload, name, type: resolveType(name, req.headers['content-type'], upload.head) };
+}
+
+async function discardUpload(tmp) {
+  try { await fileStore.discard(tmp); } catch (error) { console.error('Temporary upload cleanup deferred:', error.message); }
+  fileStore.reservations.delete(tmp); // any failed unlink is now charged by disk inventory
 }
 
 // Stores an upload atomically: rows are written in a transaction and the file is moved into place as the
@@ -531,7 +541,7 @@ function storeUpload({ upload, name, type }, createEntry) {
         await finishDeletionIntent(upload.sha256);
       }
       return await inTransaction(async () => {
-        const used = await filesBytesUsed(upload.tmp);
+        const used = await filesBytesUsed(fileStore.reservations);
         const currentCharge = Math.max(await fileMetadataCharge(upload.sha256), await fileStore.storedSize(upload.sha256));
         const projectedCharge = Math.max(await fileMetadataCharge(upload.sha256), upload.size);
         if (used - currentCharge + projectedCharge > MAX_FILES_BYTES) {
@@ -544,10 +554,11 @@ function storeUpload({ upload, name, type }, createEntry) {
           [messageId, upload.sha256, name, type, upload.size, token && tokenHash(token)],
         );
         added = await fileStore.commit(upload.tmp, upload.sha256, upload.size);
+        fileStore.reservations.delete(upload.tmp);
         return { id: row.lastID, token, messageId, name, type, size: upload.size, url: fileUrl(row.lastID, name) };
       });
     } catch (error) {
-      try { await fileStore.discard(upload.tmp); } catch (cleanupError) { console.error('Temporary upload cleanup deferred:', cleanupError.message); }
+      await discardUpload(upload.tmp);
       if (added && !(await get('SELECT 1 AS found FROM attachments WHERE sha256 = ?', [upload.sha256]))) {
         await run('INSERT OR IGNORE INTO file_deletions (sha256, size) VALUES (?, ?)', [upload.sha256, upload.size]);
         try { await finishDeletionIntent(upload.sha256); } catch (cleanupError) { console.error('Uploaded file cleanup deferred:', cleanupError.message); }
