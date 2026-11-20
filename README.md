@@ -127,12 +127,15 @@ labels:
   - "traefik.http.services.clipboard.loadbalancer.server.port=3000"
 ```
 
+Traefik's `StripPrefix` supplies `X-Forwarded-Prefix`. If your proxy strips the path **without** sending that header, set `PUBLIC_BASE_URL=https://host.example/clipboard/` in the **Clippy backend environment** and restart it. Use the exact URL users open, including any non-default port and the full mount path. Clippy uses this base instead of the request headers to recognize copied local images and generate download links in `.txt` responses. Images from other origins or outside the mount path are not treated as local files. Direct LAN deployments at `/` do not need this setting.
+
 Traefik does not limit request body size by default. With nginx, raise `client_max_body_size` to at least `MAX_FILE_BYTES` for file uploads.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `PUBLIC_BASE_URL` | From request headers | Public HTTP(S) URL of the app, including its proxy prefix; omit credentials, query and fragment. |
 | `RETENTION_TIME` | `0` (keep forever) | Delete unpinned entries older than this: `90m`, `36h`, `10d`, `2w`; a bare number means days. Pinned entries are exempt until unpinned. |
 | `MAX_ENTRY_BYTES` | `10485760` | Maximum size of one entry |
 | `MAX_IMAGE_BYTES` | `5242880` | Maximum size of an image embedded as a `data:` URI by API clients (the web page stores images as files) |

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
+import { createServer, request } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -27,6 +28,7 @@ async function startServer(extraEnv = {}, existingRoot = null) {
       FILES_PATH: path.join(root, 'files'),
       LEGACY_DATABASE_PATH: path.join(root, 'no-legacy.sqlite'),
       DIST_PATH: dist,
+      PUBLIC_BASE_URL: '',
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -374,6 +376,53 @@ test('pasted images are stored as files and shown inline; unsafe types are never
   } finally {
     await stopServer(server);
   }
+});
+
+test('a copied image survives source purge behind a prefix-stripping proxy without X-Forwarded-Prefix', async (t) => {
+  const prefix = '/tools/clipboard';
+  let backend;
+  const proxy = createServer((req, res) => {
+    if (!req.url.startsWith(`${prefix}/`)) return res.writeHead(404).end();
+    const upstream = request(backend.baseURL + req.url.slice(prefix.length), {
+      method: req.method, headers: req.headers,
+    }, (reply) => {
+      res.writeHead(reply.statusCode, reply.headers);
+      reply.pipe(res);
+    });
+    upstream.on('error', () => res.writeHead(502).end());
+    req.pipe(upstream);
+  });
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => proxy.close(resolve)));
+  const origin = `http://127.0.0.1:${proxy.address().port}`;
+  const base = origin + prefix;
+  backend = await startServer({ PUBLIC_BASE_URL: base, RETENTION_TIME: '1d', PURGE_INTERVAL_MS: '200' });
+  t.after(() => stopServer(backend));
+
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+  const image = await (await upload(base, 'proxy.png', png)).json();
+  const source = await postEntry(base, `<img src="${image.url}">`, [], [image]);
+  assert.equal(source.status, 201);
+  const { id } = await source.json();
+  const sourceURL = `${base}/${image.url}`;
+  const unrelated = `<img src="${origin}/other/${image.url}"><img src="https://other.example${prefix}/${image.url}">`;
+  const copied = await postEntry(base, `<img src="${sourceURL}">${unrelated}`);
+  assert.equal(copied.status, 201);
+  const { message } = await copied.json();
+  assert.ok(message.endsWith(unrelated));
+  const copyURL = new URL(message.match(/^<img src="([^"]+)"/)[1], `${base}/`);
+
+  const db = new DatabaseSync(path.join(backend.root, 'database.sqlite'));
+  t.after(() => db.close());
+  db.exec('PRAGMA busy_timeout = 3000');
+  db.prepare("UPDATE messages SET created_at = datetime('now', '-2 days') WHERE id = ?").run(id);
+  const sourceRow = db.prepare('SELECT id FROM attachments WHERE id = ?');
+  for (let i = 0; i < 100 && sourceRow.get(image.id); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(sourceRow.get(image.id), undefined, 'source attachment must be purged');
+  assert.equal((await fetch(sourceURL)).status, 404);
+  const download = await fetch(copyURL);
+  assert.equal(download.status, 200, 'copied image must still download after source purge');
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), png);
 });
 
 test('expired local inline image references reject the whole entry, but lookalike URLs remain external', async () => {

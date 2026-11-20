@@ -54,7 +54,7 @@
       <li v-for="item in attachments" :key="item.key" class="composer-file" :class="`is-${item.status}`">
         <i :class="['bi', fileIcon(item.type, item.name)]" aria-hidden="true"></i>
         <span class="composer-file-name" :title="item.name">{{ item.name }}</span>
-        <span class="composer-file-meta">{{ item.status === 'error' ? item.error : formatBytes(item.size) }}</span>
+        <span class="composer-file-meta"><template v-if="item.status === 'queued'">Queued · </template>{{ item.status === 'error' ? item.error : formatBytes(item.size) }}</span>
         <span v-if="item.status === 'uploading'" class="composer-file-progress" role="progressbar" :aria-valuenow="Math.round(item.progress * 100)" aria-valuemin="0" aria-valuemax="100" :aria-label="`Uploading ${item.name}`">
           <span :style="{ width: `${Math.round(item.progress * 100)}%` }"></span>
         </span>
@@ -100,6 +100,7 @@ export default {
       errorMessage: '',
       dragging: false,
       attachments: [],
+      drainingUploads: false,
       savedRange: null,
       pendingCleanupClaims: [],
       tools: [
@@ -117,7 +118,7 @@ export default {
       return Boolean(text || /<img\b/i.test(this.message));
     },
     uploading() {
-      return this.attachments.some((item) => item.status === 'uploading');
+      return this.attachments.some((item) => item.status === 'queued' || item.status === 'uploading');
     },
     readyAttachments() {
       return this.attachments.filter((item) => item.status === 'done');
@@ -138,6 +139,7 @@ export default {
   },
   beforeUnmount() {
     this.attachments.forEach((item) => item.handle?.abort());
+    this.attachments = []; // Drop queued files before the aborted upload settles.
     this.inlineBlobs.forEach((file, url) => URL.revokeObjectURL(url));
   },
   methods: {
@@ -173,7 +175,7 @@ export default {
       const maxFile = this.limits?.maxFileBytes ?? Infinity;
       const maxCount = this.limits?.maxFilesPerEntry ?? Infinity;
       for (const file of Array.from(fileList || [])) {
-        const item = { key: (attachmentKey += 1), name: file.name, size: file.size, type: file.type, status: 'uploading', progress: 0, error: '', id: null, token: null, handle: null };
+        const item = { key: (attachmentKey += 1), name: file.name, size: file.size, type: file.type, status: 'queued', progress: 0, error: '', id: null, token: null, handle: null };
         this.attachments.push(item);
         const live = this.attachments[this.attachments.length - 1]; // reactive proxy
         if (this.attachments.filter((entry) => entry.status !== 'error').length > maxCount) {
@@ -181,20 +183,36 @@ export default {
         } else if (file.size > maxFile) {
           Object.assign(live, { status: 'error', error: `Larger than ${formatBytes(maxFile)}` });
         } else {
-          this.startUpload(live, file);
+          live.file = file;
         }
       }
+      this.drainUploads();
     },
-    startUpload(item, file) {
-      item.handle = uploadFile(file, file.name, (progress) => { item.progress = progress; });
-      item.handle.promise
-        .then((stored) => Object.assign(item, { status: 'done', id: stored.id, token: stored.token, type: stored.type, progress: 1 }))
-        .catch((error) => {
-          if (error.cancelled) return;
-          Object.assign(item, { status: 'error', error: error.message });
-        })
-        .finally(() => { item.handle = null; });
-      this.statusMessage = `Uploading ${file.name}`;
+    async drainUploads() {
+      if (this.drainingUploads) return;
+      this.drainingUploads = true;
+      try {
+        let item;
+        while ((item = this.attachments.find(entry => entry.status === 'queued'))) {
+          await this.startUpload(item);
+        }
+      } finally {
+        this.drainingUploads = false;
+      }
+    },
+    async startUpload(item) {
+      item.status = 'uploading';
+      this.statusMessage = `Uploading ${item.name}`;
+      try {
+        item.handle = uploadFile(item.file, item.name, progress => { item.progress = progress; });
+        const stored = await item.handle.promise;
+        Object.assign(item, { status: 'done', id: stored.id, token: stored.token, type: stored.type, progress: 1 });
+      } catch (error) {
+        if (!error.cancelled) Object.assign(item, { status: 'error', error: error.message });
+      } finally {
+        item.handle = null;
+        item.file = null;
+      }
     },
     removeAttachment(item) {
       item.handle?.abort();

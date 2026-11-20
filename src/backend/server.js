@@ -8,6 +8,7 @@ const { FileStore, sanitizeFileName, isInlineImageType, sniffImageType, resolveT
 
 const app = express();
 const port = process.env.PORT === '0' ? 0 : positiveInteger(process.env.PORT, 3000);
+const configuredPublicBase = parsePublicBase(process.env.PUBLIC_BASE_URL);
 const dbFilePath = process.env.DATABASE_PATH || '/data/database.sqlite';
 const LEGACY_DATABASE_PATH = process.env.LEGACY_DATABASE_PATH || '/database.sqlite';
 const packagedDistPath = path.resolve(__dirname, '../dist');
@@ -687,9 +688,18 @@ app.post('/api/messages', async (req, res) => {
   return res.status(result.status).json(result.entry);
 });
 
-// Plain-text pull:  curl -sk https://<host>/clipboard/api/latest.txt   or   .../api/messages/<id>.txt
+function parsePublicBase(value) {
+  if (!value) return null;
+  const url = URL.parse(value);
+  if (!url || !/^https?:\/\//i.test(value) || url.username || url.password || /[?#\\]/.test(value)) {
+    throw new Error('PUBLIC_BASE_URL must be an absolute HTTP(S) app URL without credentials, query or fragment');
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, '')}/`;
+}
+
 // Absolute base URL as seen by the client, including a reverse-proxy prefix (Traefik StripPrefix sets X-Forwarded-Prefix).
 function publicBase(req) {
+  if (configuredPublicBase) return configuredPublicBase;
   const first = (value) => String(value || '').split(',')[0].trim();
   const proto = first(req.get('x-forwarded-proto')) || req.protocol;
   const host = first(req.get('x-forwarded-host')) || req.get('host');

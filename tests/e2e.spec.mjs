@@ -253,7 +253,7 @@ test('copying an entry gives the stored entry without link icons, also through t
 
 test('a file attached in the composer is sent with the entry and can be downloaded', async ({ page, request }) => {
   const name = `notes-${Date.now()}.txt`;
-  await expect(page.locator('.file-limits')).toContainText('100 MB');
+  await expect(page.locator('.file-limits')).toContainText('64 KB');
   await page.locator('input[type="file"][multiple]').setInputFiles({ name, mimeType: 'text/plain', buffer: Buffer.from('lab notes') });
   await expect(page.locator('.composer-file', { hasText: name })).toHaveClass(/is-done/);
   await page.getByRole('button', { name: 'Send entry' }).click();
@@ -264,4 +264,54 @@ test('a file attached in the composer is sent with the entry and can be download
   expect(await download.text()).toBe('lab notes');
   const id = (await card.locator('.entry-id').innerText()).replace('#', '');
   await request.delete(`/api/messages/${id}`);
+});
+
+test('removing queued and active chips advances only the remaining uploads', async ({ page }) => {
+  const started = [];
+  const held = new Map();
+  await page.route('**/api/files/**', route => {
+    if (route.request().method() !== 'PUT') return route.continue();
+    const name = new URL(route.request().url()).pathname.split('/').pop();
+    started.push(name);
+    held.set(name, route); // Keep each PUT pending until cancelled or explicitly released.
+  });
+  const pick = page.locator('input[type="file"][multiple]');
+  const file = name => ({ name, mimeType: 'text/plain', buffer: Buffer.from(name) });
+  const send = page.locator('.send-button');
+  await page.getByRole('textbox', { name: 'Rich text editor' }).fill('keep this draft');
+  await pick.setInputFiles(['active.txt', 'skip.txt'].map(file));
+  await expect.poll(() => started.slice()).toEqual(['active.txt']);
+  await pick.setInputFiles(file('keep.txt')); // A second selection joins the same queue.
+  await expect(send).toBeDisabled();
+  await page.getByRole('button', { name: 'Remove skip.txt' }).click();
+  await page.getByRole('button', { name: 'Remove active.txt' }).click();
+  await expect.poll(() => started.slice()).toEqual(['active.txt', 'keep.txt']);
+  await expect(send).toBeDisabled();
+  await held.get('keep.txt').continue();
+  await expect(page.locator('.composer-file.is-done')).toContainText('keep.txt');
+  await expect(send).toBeEnabled();
+  await page.getByRole('button', { name: 'Remove keep.txt' }).click();
+});
+
+test('a valid selection larger than shared staging is saved as one entry', async ({ page, request }) => {
+  const files = ['first.bin', 'second.bin', 'third.bin'].map((name, i) => ({
+    name, mimeType: 'application/octet-stream', buffer: Buffer.alloc(48 * 1024, i + 1),
+  }));
+  await expect(page.locator('.file-limits')).toContainText('64 KB');
+  await page.locator('input[type="file"][multiple]').setInputFiles(files);
+  await expect(page.locator('.composer-file.is-done')).toHaveCount(files.length);
+  const saved = page.waitForResponse(r => r.url().endsWith('/api/messages') && r.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Send entry' }).click();
+  const { id } = await (await saved).json();
+  try {
+    const links = page.locator('.entry-card', { hasText: files[0].name }).locator('.file-name');
+    await expect(links).toHaveText(files.map(file => file.name));
+    for (const [i, file] of files.entries()) {
+      const response = await request.get(await links.nth(i).getAttribute('href'));
+      expect(response.ok()).toBe(true);
+      expect((await response.body()).equals(file.buffer)).toBe(true);
+    }
+  } finally {
+    await request.delete(`/api/messages/${id}`);
+  }
 });

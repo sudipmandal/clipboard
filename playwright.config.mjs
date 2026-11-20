@@ -3,9 +3,9 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-const runId = createHash('sha256').update(process.cwd()).digest('hex').slice(0, 12);
+const port = process.env.CLIPPY_E2E_PORT || '4173';
+const runId = createHash('sha256').update(`${process.cwd()}:${port}`).digest('hex').slice(0, 12);
 const runRoot = path.join(tmpdir(), `clippy-e2e-${runId}`);
-const port = '4173';
 const baseURL = `http://127.0.0.1:${port}`;
 process.env.CLIPPY_E2E_ROOT = runRoot;
 
@@ -29,6 +29,8 @@ export default defineConfig({
     timeout: 120_000,
     env: {
       PORT: port,
+      MAX_FILE_BYTES: '65536', // Also bounds shared upload staging in the browser suite.
+      MAX_FILES_BYTES: '8388608',
       DATABASE_PATH: path.join(runRoot, 'database.sqlite'),
       FILES_PATH: path.join(runRoot, 'files'),
       LEGACY_DATABASE_PATH: path.join(runRoot, 'no-legacy.sqlite'),
