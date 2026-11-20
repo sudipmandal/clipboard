@@ -178,17 +178,19 @@ async function verifyClaims(claims) {
 
 async function finishDeletionIntent(sha256) {
   const owners = await all('SELECT id, message_id, size FROM attachments WHERE sha256 = ?', [sha256]);
-  if (owners.some((row) => row.message_id !== null)) {
-    await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
-    return false;
-  }
   if (owners.length) {
-    const expectedSize = Math.max(...owners.map((row) => row.size));
-    if (await fileStore.isRegularFile(sha256, expectedSize)) {
-      await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
-      return false;
-    }
-    await inTransaction(() => run('DELETE FROM attachments WHERE sha256 = ? AND message_id IS NULL', [sha256]));
+    const pending = owners.filter(row => row.message_id === null);
+    // Inspect once before making any changes. An I/O error leaves the whole
+    // intent retryable; a bad recorded size says nothing about its siblings.
+    const size = pending.length ? await fileStore.readableSize(sha256) : null;
+    const keepBlob = pending.length < owners.length || pending.some(row => row.size === size);
+    await inTransaction(async () => {
+      for (const row of pending) {
+        if (row.size !== size) await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [row.id]);
+      }
+      if (keepBlob) await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
+    });
+    if (keepBlob) return false;
   }
   await fileStore.remove(sha256);
   await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
@@ -286,22 +288,38 @@ async function fileMetadataCharge(sha256) {
   return row.size;
 }
 
-// <img src="api/files/<id>/…"> (relative or absolute) inside entry HTML.
-const INLINE_FILE_SRC = /(<img\b[^>]*?\bsrc\s*=\s*)(["'])(?:[^"']*?\/)?api\/files\/(\d+)\/[^"']*\2/gi;
+// Capture the src attribute, skipping quoted values of preceding attributes.
+const INLINE_FILE_SRC = /(<img(?=\s)(?:[^<>"']|"[^"]*"|'[^']*')*?\ssrc\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s<>"']+))/gi;
+
+function localInlineId(src, base) {
+  const url = URL.parse(src, base);
+  if (!url || url.origin !== base.origin || !url.pathname.startsWith(base.pathname)) return null;
+  const match = /^api\/files\/(\d+)\/[^/]+\/?$/i.exec(url.pathname.slice(base.pathname.length));
+  return match ? Number(match[1]) : null;
+}
 
 // Links the claimed uploads to a new entry: attachments as files, inlineUploads as images referenced by the HTML.
 // An image copied from another entry gets its own attachment row so each entry owns what it shows.
 // Another client's unsent upload is never linked, even if its id appears in the HTML.
-async function linkFiles(messageId, html, attachments, inlineUploads) {
+async function linkFiles(messageId, html, attachments, inlineUploads, baseUrl) {
   for (const { id } of attachments) {
     await run('UPDATE attachments SET message_id = ?, inline = 0, claim_hash = NULL WHERE id = ? AND message_id IS NULL', [messageId, id]);
   }
   const claimedInline = new Set(inlineUploads.map((claim) => claim.id));
-  const referenced = [...new Set([...html.matchAll(INLINE_FILE_SRC)].map((match) => Number(match[3])))];
+  const base = baseUrl && URL.parse(baseUrl);
+  const localSources = new Map();
+  if (base) {
+    for (const [, , doubleQuoted, singleQuoted, unquoted] of html.matchAll(INLINE_FILE_SRC)) {
+      const src = doubleQuoted ?? singleQuoted ?? unquoted;
+      const id = localInlineId(src, base);
+      if (id !== null) localSources.set(src, id);
+    }
+  }
   const remap = new Map();
-  for (const fileId of referenced) {
+  for (const fileId of new Set(localSources.values())) {
     const row = await get('SELECT id, message_id, sha256, name, type, size FROM attachments WHERE id = ?', [fileId]);
-    if (!row || !isInlineImageType(row.type)) continue;
+    if (!row) throw httpError(409, 'An inline image is no longer available, paste it again');
+    if (!isInlineImageType(row.type)) continue;
     if (row.message_id === null) {
       if (!claimedInline.has(fileId)) continue;
       await run('UPDATE attachments SET message_id = ?, inline = 1, claim_hash = NULL WHERE id = ?', [messageId, row.id]);
@@ -318,8 +336,9 @@ async function linkFiles(messageId, html, attachments, inlineUploads) {
     }
   }
   if (!remap.size) return html;
-  return html.replace(INLINE_FILE_SRC, (match, prefix, quote, fileId) => {
-    const row = remap.get(Number(fileId));
+  return html.replace(INLINE_FILE_SRC, (match, prefix, doubleQuoted, singleQuoted, unquoted) => {
+    const row = remap.get(localSources.get(doubleQuoted ?? singleQuoted ?? unquoted));
+    const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : '';
     return row ? `${prefix}${quote}${fileUrl(row.id, row.name)}${quote}` : match;
   });
 }
@@ -329,7 +348,7 @@ function entryId(value) {
 }
 
 // Inserts an entry with its files. Must run inside enqueueWrite + inTransaction; throws httpError on refusal.
-async function writeEntry(html, mono, attachments, inlineUploads) {
+async function writeEntry(html, mono, attachments, inlineUploads, baseUrl) {
   let currentDatabaseBytes;
   try {
     currentDatabaseBytes = databaseBytes();
@@ -341,7 +360,7 @@ async function writeEntry(html, mono, attachments, inlineUploads) {
   }
   await verifyClaims([...attachments, ...inlineUploads]);
   const result = await run('INSERT INTO messages (message, mono) VALUES (?, ?)', [html, mono ? 1 : 0]);
-  const linkedHtml = await linkFiles(result.lastID, html, attachments, inlineUploads);
+  const linkedHtml = await linkFiles(result.lastID, html, attachments, inlineUploads, baseUrl);
   if (linkedHtml !== html) await run('UPDATE messages SET message = ? WHERE id = ?', [linkedHtml, result.lastID]);
   const linked = await get('SELECT COUNT(*) AS n FROM attachments WHERE message_id = ?', [result.lastID]);
   if (linked.n > MAX_FILES_PER_ENTRY) throw httpError(400, `At most ${MAX_FILES_PER_ENTRY} files per entry`);
@@ -349,7 +368,7 @@ async function writeEntry(html, mono, attachments, inlineUploads) {
 }
 
 // Validates, then writes the entry and links its files in one transaction. Returns { status, entry } or { status, error }.
-async function insertEntry(html, mono, attachments = [], inlineUploads = []) {
+async function insertEntry(html, mono, attachments = [], inlineUploads = [], baseUrl) {
   if (!html.trim() && !attachments.length) return { status: 400, error: 'Entry content is required' };
   const claimedFiles = new Set([...attachments, ...inlineUploads].map((claim) => claim.id));
   if (claimedFiles.size > MAX_FILES_PER_ENTRY) return { status: 400, error: `At most ${MAX_FILES_PER_ENTRY} files per entry` };
@@ -357,7 +376,7 @@ async function insertEntry(html, mono, attachments = [], inlineUploads = []) {
   if (hasOversizedImage(html)) return { status: 413, error: 'An embedded image is too large' };
   try {
     const entry = await enqueueWrite(async () => {
-      const id = await inTransaction(() => writeEntry(html, mono, attachments, inlineUploads));
+      const id = await inTransaction(() => writeEntry(html, mono, attachments, inlineUploads, baseUrl));
       return loadEntry(id);
     });
     return { status: 201, entry };
@@ -652,7 +671,7 @@ app.get('/api/messages', async (req, res) => {
 app.post('/api/messages', async (req, res) => {
   const text = typeof req.body?.text === 'string' ? req.body.text : '';
   // attachments / inlineUploads: [{ id, token }] as returned by PUT /api/files/<name>
-  const result = await insertEntry(text, req.body?.mono === true, parseClaims(req.body?.attachments), parseClaims(req.body?.inlineUploads));
+  const result = await insertEntry(text, req.body?.mono === true, parseClaims(req.body?.attachments), parseClaims(req.body?.inlineUploads), publicBase(req));
   if (result.error) return res.status(result.status).json({ error: result.error });
   return res.status(result.status).json(result.entry);
 });

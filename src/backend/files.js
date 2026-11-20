@@ -139,22 +139,30 @@ class FileStore {
     try {
       await fsp.access(this.pathFor(sha256));
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    }
+  }
+
+  // null means confirmed missing or non-regular. Inspection errors must reach
+  // callers: recovery cannot retire an owner based on an unknown size.
+  async readableSize(sha256) {
+    try {
+      const target = this.pathFor(sha256);
+      const stat = await fsp.stat(target);
+      if (!stat.isFile()) return null;
+      const handle = await fsp.open(target, 'r');
+      await handle.close();
+      return stat.size;
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
     }
   }
 
   async isRegularFile(sha256, size) {
-    try {
-      const target = this.pathFor(sha256);
-      const stat = await fsp.stat(target);
-      if (!stat.isFile() || stat.size !== size) return false;
-      const handle = await fsp.open(target, 'r');
-      await handle.close();
-      return true;
-    } catch {
-      return false;
-    }
+    return (await this.readableSize(sha256)) === size;
   }
 
   async storedSize(sha256) {
@@ -174,7 +182,8 @@ class FileStore {
       const full = path.join(this.tmpDir, file);
       if (exclude && path.resolve(full) === path.resolve(exclude)) continue;
       const stat = await fsp.stat(full);
-      if (stat.isFile()) total += stat.size;
+      if (!stat.isFile()) throw new Error('Temp inventory contains a non-regular file');
+      total += stat.size;
     }
     return total;
   }
@@ -255,8 +264,13 @@ class FileStore {
     const files = await fsp.readdir(this.tmpDir).catch(() => []);
     for (const file of files) {
       const full = path.join(this.tmpDir, file);
-      const stat = await fsp.stat(full).catch(() => null);
-      if (stat && now - stat.mtimeMs >= maxAgeMs) await fsp.rm(full, { force: true });
+      try {
+        const stat = await fsp.stat(full);
+        if (now - stat.mtimeMs >= maxAgeMs) await fsp.rm(full, { force: true });
+      } catch (error) {
+        // Best effort only: tmpBytes still inventories stranded files for admission.
+        if (error.code !== 'ENOENT') console.warn('Temp cleanup deferred:', error.message);
+      }
     }
   }
 }

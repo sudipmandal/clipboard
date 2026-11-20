@@ -145,7 +145,7 @@ Traefik does not limit request body size by default. With nginx, raise `client_m
 
 ## Release
 
-Current application version: **1.6.1**. This hotfix enforces file-count and physical-storage limits across attached and inline files, prevents composer changes or failed files from being silently discarded during save, cleans failed inline uploads immediately, and separates adjacent web addresses correctly.
+Current application version: **1.6.1**. This hotfix enforces file-count and physical-storage limits across attached and inline files, prevents composer changes or failed files from being silently discarded during save, cleans failed inline uploads immediately, and separates adjacent web addresses correctly. A copied local image whose source has expired is rejected rather than saved as a broken link. File recovery preserves pending owners when storage cannot be inspected; failed temporary-file cleanup is retried and its bytes still count toward the quota. Normal deduplication checks readability and size, not a fresh checksum of existing bytes.
 
 Pushing a semantic-version tag such as `v1.6.1` starts the GitHub Actions workflow. The tag build publishes the multi-architecture Docker image and creates a GitHub Release with generated release notes. GitHub automatically provides source-code archives in `.zip` and `.tar.gz` formats for the tag.
 

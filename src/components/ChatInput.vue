@@ -158,8 +158,9 @@ export default {
     },
     onDrop(event) {
       this.dragging = false;
-      if (this.sending || !this.hasFiles(event)) return;
-      event.preventDefault();
+      if (!this.hasFiles(event)) return;
+      event.preventDefault(); // Never let a rejected file drop navigate away from the draft.
+      if (this.sending) return;
       this.addFiles(event.dataTransfer.files);
     },
     onFilesPicked(event) {
