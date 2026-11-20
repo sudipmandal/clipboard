@@ -196,7 +196,16 @@ class FileStore {
     for (const file of await fsp.readdir(this.tmpDir)) {
       const full = path.join(this.tmpDir, file);
       if (exclude?.has(full)) continue;
-      const stat = await fsp.stat(full);
+      let stat;
+      try {
+        stat = await fsp.stat(full);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        // Cleanup can unlink a temp after readdir. A missing .tmp or a
+        // still-listed child (e.g. a dangling symlink) is not that race.
+        if ((await fsp.readdir(this.tmpDir)).includes(file)) throw error;
+        continue;
+      }
       if (!stat.isFile()) throw new Error('Temp inventory contains a non-regular file');
       total += stat.size;
     }

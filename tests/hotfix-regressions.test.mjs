@@ -12,12 +12,11 @@ async function withFixture(run, parentEnv = process.env) {
   const root = mkdtempSync(path.join(tmpdir(), 'clippy-hotfix-'));
   const stops = [];
   async function launch(args, extraEnv) {
-    const port = 4900 + Math.floor(Math.random() * 800);
     const child = spawn(process.execPath, args, {
       cwd: projectRoot,
       env: {
         ...parentEnv,
-        PORT: String(port),
+        PORT: '0',
         DATABASE_PATH: path.join(root, 'database.sqlite'),
         FILES_PATH: path.join(root, 'files'),
         LEGACY_DATABASE_PATH: path.join(root, 'no-legacy.sqlite'),
@@ -51,7 +50,8 @@ async function withFixture(run, parentEnv = process.env) {
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     for (let attempt = 0; attempt < 60; attempt += 1) {
       if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
-      if (stdout.includes(`Clippy listening on port ${port} `)) return { root, child, baseURL: `http://127.0.0.1:${port}`, stop };
+      const port = /Clippy listening on port (\d+) /.exec(stdout)?.[1];
+      if (port) return { root, child, baseURL: `http://127.0.0.1:${port}`, stop };
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     throw new Error(`server failed: ${spawnError || stderr}`);

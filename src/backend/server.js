@@ -7,7 +7,7 @@ const { parseDuration, formatDuration, formatBytes, plainTextToHtml, htmlToPlain
 const { FileStore, sanitizeFileName, isInlineImageType, sniffImageType, resolveType, contentDisposition, httpError } = require('./files');
 
 const app = express();
-const port = positiveInteger(process.env.PORT, 3000);
+const port = process.env.PORT === '0' ? 0 : positiveInteger(process.env.PORT, 3000);
 const dbFilePath = process.env.DATABASE_PATH || '/data/database.sqlite';
 const LEGACY_DATABASE_PATH = process.env.LEGACY_DATABASE_PATH || '/database.sqlite';
 const packagedDistPath = path.resolve(__dirname, '../dist');
@@ -785,8 +785,8 @@ initDatabase()
   .then(async () => {
     await purgeExpired();
     setInterval(purgeExpired, PURGE_INTERVAL_MS).unref();
-    app.listen(port, () => console.log(
-      `Clippy listening on port ${port} (retention ${formatDuration(RETENTION_SECONDS)}, files up to ${formatBytes(MAX_FILE_BYTES)} each, ${formatBytes(MAX_FILES_BYTES)} total in ${FILES_PATH})`,
+    const listener = app.listen(port, () => console.log(
+      `Clippy listening on port ${listener.address().port} (retention ${formatDuration(RETENTION_SECONDS)}, files up to ${formatBytes(MAX_FILE_BYTES)} each, ${formatBytes(MAX_FILES_BYTES)} total in ${FILES_PATH})`,
     ));
   })
   .catch((error) => {

@@ -8,8 +8,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { FileStore } from '../src/backend/files.js';
 
-async function fixture(t) {
+async function fixture(t, setup = '') {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'staging-integrity-'));
   const files = path.join(root, 'files');
   const child = spawn(process.execPath, ['-e', `
@@ -18,6 +19,7 @@ async function fixture(t) {
       this.once('listening', () => process.send(this.address().port));
       return listen.call(this, 0, '127.0.0.1', cb);
     };
+    ${setup}
     require('./src/backend/server');`], {
     cwd: path.resolve(import.meta.dirname, '..'), stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
     env: { TMPDIR: root, FILES_PATH: files, DATABASE_PATH: path.join(root, 'db.sqlite'),
@@ -31,6 +33,40 @@ async function fixture(t) {
   const base = `http://127.0.0.1:${port}`;
   return { base, files, put: (route, body) => fetch(`${base}/api/${route}/sample.bin`, { method: 'PUT', body }) };
 }
+
+test('upload skips a temp removed after enumeration but still charges surviving files', async t => {
+  const s = await fixture(t, `
+    const fs = require('node:fs/promises'), path = require('node:path');
+    const readdir = fs.readdir, tmp = path.join(process.env.FILES_PATH, '.tmp');
+    fs.readdir = async (dir, ...args) => {
+      const names = await readdir(dir, ...args);
+      if (dir === tmp && names.includes('aborted')) await fs.unlink(path.join(tmp, 'aborted'));
+      return names;
+    };`);
+  const tmp = path.join(s.files, '.tmp');
+  await fs.writeFile(path.join(tmp, 'aborted'), 'gone');
+  await fs.writeFile(path.join(tmp, 'stranded'), Buffer.alloc(16));
+  assert.equal((await s.put('upload', Buffer.alloc(49))).status, 413);
+  await fs.writeFile(path.join(tmp, 'aborted'), 'gone');
+  assert.equal((await s.put('upload', Buffer.alloc(48))).status, 201);
+});
+
+test('tmpBytes propagates staging inventory failures', async t => {
+  const root = await fs.mkdtemp(path.join(tmpdir(), 'staging-inventory-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const store = new FileStore(root);
+  await assert.rejects(store.tmpBytes(), { code: 'ENOENT' });
+  await store.init();
+  const link = path.join(store.tmpDir, 'dangling');
+  await fs.symlink('missing', link);
+  await assert.rejects(store.tmpBytes(), { code: 'ENOENT' });
+  await fs.unlink(link);
+  await fs.mkdir(path.join(store.tmpDir, 'unexpected'));
+  await assert.rejects(store.tmpBytes(), /non-regular file/);
+  const error = Object.assign(new Error('stat failed'), { code: 'EIO' });
+  t.mock.method(fs, 'stat', async () => { throw error; });
+  await assert.rejects(store.tmpBytes(), e => e === error);
+});
 
 test('same-length corruption is repaired for the original entry at full quota', async t => {
   const s = await fixture(t);

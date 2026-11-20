@@ -92,6 +92,15 @@ test('Accessibility Insights automated checks find no WCAG A/AA violations', asy
   await accessibilityInsightsScan(page, testInfo);
 });
 
+test('accessibility: User guide dialog and focus return', async ({ page }, testInfo) => {
+  const guide = page.getByRole('button', { name: /guide/i }).first();
+  await guide.click();
+  await expect(page.getByRole('dialog', { name: 'User guide' })).toBeVisible();
+  await accessibilityInsightsScan(page, testInfo);
+  await page.keyboard.press('Escape');
+  await expect(guide).toBeFocused();
+});
+
 test('Accessibility Insights tab-stop check has logical focus order and no traps', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.reload();
