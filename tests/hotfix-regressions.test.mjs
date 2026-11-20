@@ -111,34 +111,41 @@ test('MAX_FILES_PER_ENTRY counts copied inline rows created during linking', asy
   } finally { await stopServer(server); }
 });
 
-test('failed blob removal keeps pending metadata and token retryable', async () => {
+test('failed blob removal keeps a durable deletion intent', async () => {
   const server = await startServer();
+  const root = server.root;
   try {
     const { file } = await upload(server.baseURL, 'retry.bin', Buffer.from('retry'), 'application/octet-stream');
-    const [sha] = storedFiles(server.root);
-    const blob = path.join(server.root, 'files', sha.slice(0, 2), sha);
-    rmSync(blob);
-    mkdirSync(blob);
-    const failed = await fetch(`${server.baseURL}/api/files/${file.id}`, { method: 'DELETE', headers: { 'x-upload-token': file.token } });
-    assert.equal(failed.status, 500);
-    assert.equal(rowCount(server.root, 'SELECT COUNT(*) AS n FROM attachments WHERE message_id IS NULL'), 1);
-    rmSync(blob, { recursive: true });
-    assert.equal((await fetch(`${server.baseURL}/api/files/${file.id}`, { method: 'DELETE', headers: { 'x-upload-token': file.token } })).status, 204);
+    const [sha] = storedFiles(root);
+    const blob = path.join(root, 'files', sha.slice(0, 2), sha);
+    rmSync(blob); mkdirSync(blob);
+    const accepted = await fetch(`${server.baseURL}/api/files/${file.id}`, { method: 'DELETE', headers: { 'x-upload-token': file.token } });
+    assert.equal(accepted.status, 204);
+    assert.equal(rowCount(root, 'SELECT COUNT(*) AS n FROM attachments WHERE message_id IS NULL'), 0);
+    assert.equal(rowCount(root, 'SELECT COUNT(*) AS n FROM file_deletions'), 1);
   } finally { await stopServer(server); }
 });
 
-test('unlink I/O failure preserves quota and token for retry', async () => {
+test('unlink I/O failure records durable intent and preserves quota until restart', async () => {
   const fault = "const fs=require('node:fs/promises'),rm=fs.rm.bind(fs);fs.rm=(p,...a)=>/[/\\\\][0-9a-f]{64}$/.test(String(p))?Promise.reject(Object.assign(new Error('injected unlink failure'),{code:'EIO'})):rm(p,...a)";
   const server = await startFaultServer(fault);
+  const root = server.root;
   try {
     const body = Buffer.from('unlink me');
     const { file } = await upload(server.baseURL, 'unlink.bin', body, 'application/octet-stream');
-    const failed = await fetch(`${server.baseURL}/api/files/${file.id}`, { method: 'DELETE', headers: { 'x-upload-token': file.token } });
-    assert.equal(failed.status, 500);
-    const config = await (await fetch(`${server.baseURL}/api/config`)).json();
-    assert.equal(config.filesBytesUsed, body.length);
-    assert.equal(rowCount(server.root, 'SELECT COUNT(*) AS n FROM attachments WHERE message_id IS NULL'), 1);
-  } finally { await stopServer(server); }
+    const accepted = await fetch(`${server.baseURL}/api/files/${file.id}`, { method: 'DELETE', headers: { 'x-upload-token': file.token } });
+    assert.equal(accepted.status, 204);
+    assert.equal((await (await fetch(`${server.baseURL}/api/config`)).json()).filesBytesUsed, body.length);
+    assert.equal(rowCount(root, 'SELECT COUNT(*) AS n FROM attachments WHERE message_id IS NULL'), 0);
+    assert.equal(rowCount(root, 'SELECT COUNT(*) AS n FROM file_deletions'), 1);
+    server.child.kill('SIGTERM');
+    await new Promise((resolve) => server.child.once('exit', resolve));
+    const recovered = await startServer({}, root);
+    try {
+      assert.equal((await (await fetch(`${recovered.baseURL}/api/config`)).json()).filesBytesUsed, 0);
+      assert.equal(rowCount(root, 'SELECT COUNT(*) AS n FROM file_deletions'), 0);
+    } finally { await stopServer(recovered); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('missing pending blob cannot be claimed into a saved entry', async () => {
@@ -153,16 +160,94 @@ test('missing pending blob cannot be claimed into a saved entry', async () => {
   } finally { await stopServer(server); }
 });
 
-test('expiry unlink failure keeps physical bytes charged', async () => {
+test('expiry unlink failure keeps physical bytes charged until recovery', async () => {
   const fault = "const fs=require('node:fs/promises'),rm=fs.rm.bind(fs);fs.rm=(p,...a)=>/[/\\\\][0-9a-f]{64}$/.test(String(p))?Promise.reject(Object.assign(new Error('injected expiry unlink failure'),{code:'EIO'})):rm(p,...a)";
   const server = await startFaultServer(fault, { MAX_FILES_BYTES: '64', RETENTION_TIME: '1s', PURGE_INTERVAL_MS: '100' });
+  const root = server.root;
   try {
     const pending = (await upload(server.baseURL, 'linked.bin', Buffer.alloc(64, 2), 'application/octet-stream')).file;
     assert.equal((await postEntry(server.baseURL, { text: 'linked', attachments: claims([pending]) })).status, 201);
-    await new Promise((resolve) => setTimeout(resolve, 1400));
-    const config = await (await fetch(`${server.baseURL}/api/config`)).json();
-    assert.equal(config.filesBytesUsed, 64);
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const entries = await (await fetch(`${server.baseURL}/api/messages`)).json();
+      if (!entries.some((entry) => entry.message === 'linked') && rowCount(root, 'SELECT COUNT(*) AS n FROM file_deletions') === 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal((await (await fetch(`${server.baseURL}/api/messages`)).json()).some((entry) => entry.message === 'linked'), false);
+    assert.equal(rowCount(root, 'SELECT COUNT(*) AS n FROM file_deletions'), 1);
+    assert.equal((await (await fetch(`${server.baseURL}/api/config`)).json()).filesBytesUsed, 64);
     assert.equal((await upload(server.baseURL, 'replacement.bin', Buffer.alloc(64, 3), 'application/octet-stream')).response.status, 413);
+    server.child.kill('SIGTERM');
+    await new Promise((resolve) => server.child.once('exit', resolve));
+    const recovered = await startServer({ MAX_FILES_BYTES: '64' }, root);
+    try {
+      assert.equal((await (await fetch(`${recovered.baseURL}/api/config`)).json()).filesBytesUsed, 0);
+      assert.equal(rowCount(root, 'SELECT COUNT(*) AS n FROM file_deletions'), 0);
+    } finally { await stopServer(recovered); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('startup cancels stale deletion intent when a linked owner exists', async () => {
+  const server = await startServer();
+  const root = server.root;
+  try {
+    const body = Buffer.from('linked owner');
+    const pending = (await upload(server.baseURL, 'owner.bin', body, 'application/octet-stream')).file;
+    const saved = await (await postEntry(server.baseURL, { text: 'owner', attachments: claims([pending]) })).json();
+    const [sha] = storedFiles(root);
+    const db = new DatabaseSync(path.join(root, 'database.sqlite'));
+    db.prepare('INSERT INTO file_deletions (sha256, size) VALUES (?, ?)').run(sha, body.length); db.close();
+    server.child.kill('SIGTERM'); await new Promise((resolve) => server.child.once('exit', resolve));
+    const restarted = await startServer({}, root);
+    try {
+      assert.equal(rowCount(root, 'SELECT COUNT(*) AS n FROM file_deletions'), 0);
+      assert.equal((await fetch(`${restarted.baseURL}/${saved.files[0].url}`)).status, 200);
+    } finally { await stopServer(restarted); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('incomplete filesystem inventory fails quota admission closed', async () => {
+  const fault = "const fs=require('node:fs'),fsp=require('node:fs/promises'),path=require('node:path'),rd=fsp.readdir.bind(fsp);fsp.readdir=(p,...a)=>fs.existsSync(path.join(path.dirname(process.env.DATABASE_PATH),'scan-fault'))&&/[/\\\\][0-9a-f]{2}$/.test(String(p))?Promise.reject(Object.assign(new Error('injected scan failure'),{code:'EIO'})):rd(p,...a)";
+  const server = await startFaultServer(fault, { MAX_FILES_BYTES: '64' });
+  try {
+    const body = Buffer.alloc(64, 1);
+    const uploaded = (await upload(server.baseURL, 'orphan.bin', body, 'application/octet-stream')).file;
+    const db = new DatabaseSync(path.join(server.root, 'database.sqlite'));
+    db.prepare('DELETE FROM attachments WHERE id = ?').run(uploaded.id); db.close();
+    const fs = await import('node:fs/promises');
+    await fs.writeFile(path.join(server.root, 'scan-fault'), 'on');
+    assert.equal((await (await fetch(`${server.baseURL}/api/config`)).json()).filesBytesUsed, null);
+    assert.equal((await upload(server.baseURL, 'other.bin', Buffer.alloc(64, 2), 'application/octet-stream')).response.status, 500);
+  } finally { await stopServer(server); }
+});
+
+test('expiry preserves a fresh pending duplicate of expired bytes', async () => {
+  const server = await startServer({ RETENTION_TIME: '1s', PURGE_INTERVAL_MS: '100' });
+  try {
+    const body = Buffer.from('shared expiry bytes');
+    const first = (await upload(server.baseURL, 'saved.bin', body, 'application/octet-stream')).file;
+    assert.equal((await postEntry(server.baseURL, { text: 'expires', attachments: claims([first]) })).status, 201);
+    const fresh = (await upload(server.baseURL, 'fresh.bin', body, 'application/octet-stream')).file;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (!(await (await fetch(`${server.baseURL}/api/messages`)).json()).some((entry) => entry.message === 'expires')) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal((await postEntry(server.baseURL, { text: 'survives', attachments: claims([fresh]) })).status, 201);
+    assert.equal((await fetch(`${server.baseURL}/${fresh.url}`)).status, 200);
+  } finally { await stopServer(server); }
+});
+
+test('re-upload repairs a missing charged blob without double-counting quota', async () => {
+  const server = await startServer({ MAX_FILES_BYTES: '64' });
+  try {
+    const body = Buffer.alloc(64, 7);
+    const original = (await upload(server.baseURL, 'original.bin', body, 'application/octet-stream')).file;
+    const saved = await (await postEntry(server.baseURL, { text: 'repairable', attachments: claims([original]) })).json();
+    const [sha] = storedFiles(server.root);
+    rmSync(path.join(server.root, 'files', sha.slice(0, 2), sha));
+    const repair = await upload(server.baseURL, 'repair.bin', body, 'application/octet-stream');
+    assert.equal(repair.response.status, 201);
+    assert.equal((await fetch(`${server.baseURL}/${saved.files[0].url}`)).status, 200);
+    assert.equal((await (await fetch(`${server.baseURL}/api/config`)).json()).filesBytesUsed, 64);
   } finally { await stopServer(server); }
 });
 

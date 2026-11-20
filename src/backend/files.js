@@ -157,6 +157,17 @@ class FileStore {
     }
   }
 
+  async storedSize(sha256) {
+    try {
+      const stat = await fsp.stat(this.pathFor(sha256));
+      if (!stat.isFile()) throw Object.assign(new Error('Stored blob is not a regular file'), { code: 'EFTYPE' });
+      return stat.size;
+    } catch (error) {
+      if (error.code === 'ENOENT') return 0;
+      throw error;
+    }
+  }
+
   // Moves an upload into place; if the same content is already stored, the upload is simply dropped.
   async commit(tmp, sha256, size) {
     const target = this.pathFor(sha256);
@@ -190,12 +201,16 @@ class FileStore {
 
   async listStored() {
     const stored = [];
-    const dirs = await fsp.readdir(this.root).catch(() => []);
+    let dirs;
+    try { dirs = await fsp.readdir(this.root); } catch (error) {
+      if (error.code === 'ENOENT') return stored;
+      throw error;
+    }
     for (const dir of dirs) {
       if (!/^[0-9a-f]{2}$/.test(dir)) continue;
-      for (const file of await fsp.readdir(path.join(this.root, dir)).catch(() => [])) {
+      for (const file of await fsp.readdir(path.join(this.root, dir))) {
         if (!SHA256.test(file) || !file.startsWith(dir)) continue;
-        const stat = await fsp.stat(path.join(this.root, dir, file)).catch(() => null);
+        const stat = await fsp.stat(path.join(this.root, dir, file));
         if (stat?.isFile()) stored.push({ sha256: file, size: stat.size });
       }
     }

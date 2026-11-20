@@ -83,7 +83,7 @@ async function initDatabase() {
   )`);
   await run('PRAGMA foreign_keys = ON'); // attachments follow their entry when it is purged
   await fileStore.init();
-  await recordOrphanFiles();
+  try { await recordOrphanFiles(); } catch (error) { console.error('File inventory is incomplete:', error.message); }
   await reconcileFileDeletions();
 }
 
@@ -167,19 +167,24 @@ function parseClaims(value) {
 
 async function verifyClaims(claims) {
   for (const { id, token } of claims) {
-    const row = await get('SELECT sha256, size, claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
-    if (!row || !tokenMatches(row.claim_hash, token) || !(await fileStore.isRegularFile(row.sha256, row.size))) {
+    const row = await get(`SELECT a.sha256, a.size, a.claim_hash, d.sha256 AS deleting
+      FROM attachments a LEFT JOIN file_deletions d ON d.sha256 = a.sha256
+      WHERE a.id = ? AND a.message_id IS NULL`, [id]);
+    if (!row || row.deleting || !tokenMatches(row.claim_hash, token) || !(await fileStore.isRegularFile(row.sha256, row.size))) {
       throw httpError(409, 'An attached file is no longer available, attach it again');
     }
   }
 }
 
 async function finishDeletionIntent(sha256) {
-  await fileStore.remove(sha256);
-  await inTransaction(async () => {
-    await run('DELETE FROM attachments WHERE sha256 = ? AND message_id IS NULL', [sha256]);
+  if (await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? AND message_id IS NOT NULL LIMIT 1', [sha256])) {
     await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
-  });
+    return false;
+  }
+  await inTransaction(() => run('DELETE FROM attachments WHERE sha256 = ? AND message_id IS NULL', [sha256]));
+  await fileStore.remove(sha256);
+  await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
+  return true;
 }
 
 async function reconcileFileDeletions() {
@@ -202,10 +207,11 @@ async function deletePendingUpload(id, token) {
     if (!row || !tokenMatches(row.claim_hash, token)) return false;
     const shared = await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? AND id != ? LIMIT 1', [row.sha256, id]);
     if (shared) await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
-    else {
+    else await inTransaction(async () => {
       await run('INSERT OR IGNORE INTO file_deletions (sha256, size) SELECT sha256, size FROM attachments WHERE id = ?', [id]);
-      await finishDeletionIntent(row.sha256);
-    }
+      await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+    });
+    if (!shared) try { await finishDeletionIntent(row.sha256); } catch (error) { console.error('Pending file deletion deferred:', error.message); }
     return true;
   });
 }
@@ -263,6 +269,13 @@ async function filesBytesUsed() {
     bytesByHash.set(sha256, Math.max(bytesByHash.get(sha256) || 0, size));
   }
   return [...bytesByHash.values()].reduce((total, size) => total + size, 0);
+}
+
+async function fileBytesCharged(sha256) {
+  const row = await get(`SELECT COALESCE(MAX(size), 0) AS size FROM (
+    SELECT size FROM attachments WHERE sha256 = ? UNION ALL SELECT size FROM file_deletions WHERE sha256 = ?
+  )`, [sha256, sha256]);
+  return Math.max(row.size, await fileStore.storedSize(sha256));
 }
 
 // <img src="api/files/<id>/…"> (relative or absolute) inside entry HTML.
@@ -347,32 +360,29 @@ function purgeExpired() {
   return enqueueWrite(async () => {
     let removed = 0;
     await inTransaction(async () => {
+      await run('CREATE TEMP TABLE IF NOT EXISTS purge_attachments (id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)');
+      await run('DELETE FROM purge_attachments');
       const retentionClause = RETENTION_SECONDS > 0
         ? "(m.created_at < datetime('now', ?) AND m.is_pinned = 0) OR "
         : '';
       const retentionParams = RETENTION_SECONDS > 0 ? [`-${RETENTION_SECONDS} seconds`] : [];
-      await run(`INSERT OR IGNORE INTO file_deletions (sha256, size)
-        SELECT a.sha256, MAX(a.size) FROM attachments a
-        WHERE (
-          a.message_id IN (SELECT m.id FROM messages m WHERE ${retentionClause}(m.deleted_at IS NOT NULL AND julianday(m.deleted_at) < julianday('now', ?)))
-          OR (a.message_id IS NULL AND julianday(a.created_at) < julianday('now', ?))
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM attachments keep
-          WHERE keep.sha256 = a.sha256 AND NOT (
-            keep.message_id IN (SELECT m.id FROM messages m WHERE ${retentionClause}(m.deleted_at IS NOT NULL AND julianday(m.deleted_at) < julianday('now', ?)))
-            OR (keep.message_id IS NULL AND julianday(keep.created_at) < julianday('now', ?))
-          )
-        ) GROUP BY a.sha256`, [
-        ...retentionParams, `-${DELETED_ENTRY_PURGE_SECONDS} seconds`, `-${PENDING_UPLOAD_SECONDS} seconds`,
+      await run(`INSERT INTO purge_attachments (id, sha256, size)
+        SELECT a.id, a.sha256, a.size FROM attachments a
+        WHERE a.message_id IN (
+          SELECT m.id FROM messages m WHERE ${retentionClause}(m.deleted_at IS NOT NULL AND julianday(m.deleted_at) < julianday('now', ?))
+        ) OR (a.message_id IS NULL AND julianday(a.created_at) < julianday('now', ?))`, [
         ...retentionParams, `-${DELETED_ENTRY_PURGE_SECONDS} seconds`, `-${PENDING_UPLOAD_SECONDS} seconds`,
       ]);
       if (RETENTION_SECONDS > 0) {
         removed += (await run("DELETE FROM messages WHERE created_at < datetime('now', ?) AND is_pinned = 0", [`-${RETENTION_SECONDS} seconds`])).changes;
       }
       removed += (await run("DELETE FROM messages WHERE deleted_at IS NOT NULL AND julianday(deleted_at) < julianday('now', ?)", [`-${DELETED_ENTRY_PURGE_SECONDS} seconds`])).changes;
-      await run('DELETE FROM attachments WHERE message_id IS NOT NULL AND message_id NOT IN (SELECT id FROM messages)');
-      await run("DELETE FROM attachments WHERE message_id IS NULL AND julianday(created_at) < julianday('now', ?)", [`-${PENDING_UPLOAD_SECONDS} seconds`]);
+      await run('DELETE FROM attachments WHERE id IN (SELECT id FROM purge_attachments)');
+      await run(`INSERT OR IGNORE INTO file_deletions (sha256, size)
+        SELECT p.sha256, MAX(p.size) FROM purge_attachments p
+        WHERE NOT EXISTS (SELECT 1 FROM attachments a WHERE a.sha256 = p.sha256)
+        GROUP BY p.sha256`);
+
     });
     await reconcileFileDeletions();
     const keep = new Set((await all('SELECT sha256 FROM attachments UNION SELECT sha256 FROM file_deletions')).map((row) => row.sha256));
@@ -489,7 +499,9 @@ function storeUpload({ upload, name, type }, createEntry) {
         await finishDeletionIntent(upload.sha256);
       }
       return await inTransaction(async () => {
-        if (!(await fileStore.isRegularFile(upload.sha256, upload.size)) && (await filesBytesUsed()) + upload.size > MAX_FILES_BYTES) {
+        const used = await filesBytesUsed();
+        const increase = Math.max(0, upload.size - await fileBytesCharged(upload.sha256));
+        if (used + increase > MAX_FILES_BYTES) {
           throw httpError(413, `File storage is full (${formatBytes(MAX_FILES_BYTES)})`);
         }
         const messageId = createEntry ? await writeEntry('', false, [], []) : null;
