@@ -8,9 +8,9 @@ import test from 'node:test';
 import { findUrls } from '../src/linkify.mjs';
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
-async function startServer(extraEnv = {}) {
-  const root = mkdtempSync(path.join(tmpdir(), 'clippy-hotfix-'));
-  mkdirSync(path.join(root, 'dist'));
+async function startServer(extraEnv = {}, existingRoot = null) {
+  const root = existingRoot || mkdtempSync(path.join(tmpdir(), 'clippy-hotfix-'));
+  mkdirSync(path.join(root, 'dist'), { recursive: true });
   const port = 4900 + Math.floor(Math.random() * 500);
   const child = spawn(process.execPath, ['src/backend/server.js'], {
     cwd: projectRoot,
@@ -36,7 +36,7 @@ async function startServer(extraEnv = {}) {
 }
 async function startFaultServer(faultScript, extraEnv = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'clippy-hotfix-fault-'));
-  mkdirSync(path.join(root, 'dist'));
+  mkdirSync(path.join(root, 'dist'), { recursive: true });
   const port = 5400 + Math.floor(Math.random() * 300);
   const child = spawn(process.execPath, ['-e', `${faultScript};require('./src/backend/server.js')`], {
     cwd: projectRoot,
@@ -151,6 +151,57 @@ test('missing pending blob cannot be claimed into a saved entry', async () => {
     assert.equal(response.status, 409);
     assert.equal(rowCount(server.root, 'SELECT COUNT(*) AS n FROM messages'), 0);
   } finally { await stopServer(server); }
+});
+
+test('expiry unlink failure keeps physical bytes charged', async () => {
+  const fault = "const fs=require('node:fs/promises'),rm=fs.rm.bind(fs);fs.rm=(p,...a)=>/[/\\\\][0-9a-f]{64}$/.test(String(p))?Promise.reject(Object.assign(new Error('injected expiry unlink failure'),{code:'EIO'})):rm(p,...a)";
+  const server = await startFaultServer(fault, { MAX_FILES_BYTES: '64', RETENTION_TIME: '1s', PURGE_INTERVAL_MS: '100' });
+  try {
+    const pending = (await upload(server.baseURL, 'linked.bin', Buffer.alloc(64, 2), 'application/octet-stream')).file;
+    assert.equal((await postEntry(server.baseURL, { text: 'linked', attachments: claims([pending]) })).status, 201);
+    await new Promise((resolve) => setTimeout(resolve, 1400));
+    const config = await (await fetch(`${server.baseURL}/api/config`)).json();
+    assert.equal(config.filesBytesUsed, 64);
+    assert.equal((await upload(server.baseURL, 'replacement.bin', Buffer.alloc(64, 3), 'application/octet-stream')).response.status, 413);
+  } finally { await stopServer(server); }
+});
+
+test('non-regular or wrong-size pending blob cannot be claimed', async () => {
+  const server = await startServer();
+  try {
+    const body = Buffer.from('regular bytes');
+    const { file } = await upload(server.baseURL, 'shape.bin', body, 'application/octet-stream');
+    const [sha] = storedFiles(server.root);
+    const blob = path.join(server.root, 'files', sha.slice(0, 2), sha);
+    rmSync(blob); mkdirSync(blob);
+    assert.equal((await postEntry(server.baseURL, { text: 'directory', attachments: claims([file]) })).status, 409);
+    rmSync(blob, { recursive: true });
+    const fs = await import('node:fs/promises');
+    await fs.writeFile(blob, Buffer.from('x'));
+    assert.equal((await postEntry(server.baseURL, { text: 'wrong size', attachments: claims([file]) })).status, 409);
+  } finally { await stopServer(server); }
+});
+
+test('startup reconciles interrupted deletion intent without phantom quota', async () => {
+  const server = await startServer({ MAX_FILES_BYTES: '64' });
+  const root = server.root;
+  try {
+    const body = Buffer.alloc(48, 1);
+    const { file } = await upload(server.baseURL, 'interrupted.bin', body, 'application/octet-stream');
+    const [sha] = storedFiles(root);
+    const db = new DatabaseSync(path.join(root, 'database.sqlite'));
+    db.prepare('INSERT INTO file_deletions (sha256, size) VALUES (?, ?)').run(sha, body.length);
+    db.close();
+    rmSync(path.join(root, 'files', sha.slice(0, 2), sha));
+    server.child.kill('SIGTERM');
+    await new Promise((resolve) => server.child.once('exit', resolve));
+    const restarted = await startServer({ MAX_FILES_BYTES: '64' }, root);
+    try {
+      assert.equal(rowCount(root, `SELECT COUNT(*) AS n FROM attachments WHERE id = ${file.id}`), 0);
+      assert.equal((await (await fetch(`${restarted.baseURL}/api/config`)).json()).filesBytesUsed, 0);
+      assert.equal((await upload(restarted.baseURL, 'replacement.bin', Buffer.alloc(64, 2), 'application/octet-stream')).response.status, 201);
+    } finally { await stopServer(restarted); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('over-limit rollback cannot expose uncommitted entry or undo acknowledged mutation', async () => {

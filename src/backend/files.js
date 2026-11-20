@@ -144,10 +144,23 @@ class FileStore {
     }
   }
 
+  async isRegularFile(sha256, size) {
+    try {
+      const target = this.pathFor(sha256);
+      const stat = await fsp.stat(target);
+      if (!stat.isFile() || stat.size !== size) return false;
+      const handle = await fsp.open(target, 'r');
+      await handle.close();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // Moves an upload into place; if the same content is already stored, the upload is simply dropped.
-  async commit(tmp, sha256) {
+  async commit(tmp, sha256, size) {
     const target = this.pathFor(sha256);
-    if (await this.exists(sha256)) {
+    if (await this.isRegularFile(sha256, size)) {
       await fsp.rm(tmp, { force: true });
       return false;
     }
@@ -173,6 +186,20 @@ class FileStore {
     } finally {
       await handle.close();
     }
+  }
+
+  async listStored() {
+    const stored = [];
+    const dirs = await fsp.readdir(this.root).catch(() => []);
+    for (const dir of dirs) {
+      if (!/^[0-9a-f]{2}$/.test(dir)) continue;
+      for (const file of await fsp.readdir(path.join(this.root, dir)).catch(() => [])) {
+        if (!SHA256.test(file) || !file.startsWith(dir)) continue;
+        const stat = await fsp.stat(path.join(this.root, dir, file)).catch(() => null);
+        if (stat?.isFile()) stored.push({ sha256: file, size: stat.size });
+      }
+    }
+    return stored;
   }
 
   // Deletes stored files whose hash is not in `keep`. Returns the number of files removed.

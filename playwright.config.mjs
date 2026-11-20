@@ -1,6 +1,13 @@
 import { defineConfig } from '@playwright/test';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
-const baseURL = process.env.BASE_URL || 'http://127.0.0.1:4173';
+const runId = createHash('sha256').update(process.cwd()).digest('hex').slice(0, 12);
+const runRoot = path.join(tmpdir(), `clippy-e2e-${runId}`);
+const port = '4173';
+const baseURL = `http://127.0.0.1:${port}`;
+process.env.CLIPPY_E2E_ROOT = runRoot;
 
 export default defineConfig({
   workers: 1,
@@ -8,6 +15,7 @@ export default defineConfig({
   testMatch: ['**/e2e.spec.mjs', '**/hotfix-regressions.spec.mjs'],
   timeout: 30_000,
   retries: 0,
+  globalTeardown: './tests/playwright-global-teardown.mjs',
   use: {
     baseURL,
     browserName: 'chromium',
@@ -15,13 +23,16 @@ export default defineConfig({
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: 'npm run build && node src/backend/server.js',
+    command: 'node tests/prepare-e2e.mjs && npm run build && node src/backend/server.js',
     url: baseURL,
-    reuseExistingServer: true,
+    reuseExistingServer: false,
     timeout: 120_000,
     env: {
-      PORT: process.env.PORT || '4173',
-      DATABASE_PATH: process.env.DATABASE_PATH || '/tmp/clippy-e2e.sqlite',
+      PORT: port,
+      DATABASE_PATH: path.join(runRoot, 'database.sqlite'),
+      FILES_PATH: path.join(runRoot, 'files'),
+      LEGACY_DATABASE_PATH: path.join(runRoot, 'no-legacy.sqlite'),
+      DIST_PATH: path.resolve('dist'),
     },
   },
   reporter: [['list'], ['html', { outputFolder: 'playwright-report', open: 'never' }]],
