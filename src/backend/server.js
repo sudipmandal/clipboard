@@ -7,7 +7,8 @@ const { parseDuration, formatDuration, formatBytes, plainTextToHtml, htmlToPlain
 const { FileStore, sanitizeFileName, isInlineImageType, sniffImageType, resolveType, contentDisposition, httpError } = require('./files');
 
 const app = express();
-const port = positiveInteger(process.env.PORT, 3000);
+const port = process.env.PORT === '0' ? 0 : positiveInteger(process.env.PORT, 3000);
+const configuredPublicBase = parsePublicBase(process.env.PUBLIC_BASE_URL);
 const dbFilePath = process.env.DATABASE_PATH || '/data/database.sqlite';
 const LEGACY_DATABASE_PATH = process.env.LEGACY_DATABASE_PATH || '/database.sqlite';
 const packagedDistPath = path.resolve(__dirname, '../dist');
@@ -76,8 +77,15 @@ async function initDatabase() {
   if (!columns.includes('deleted_at')) await run('ALTER TABLE messages ADD COLUMN deleted_at DATETIME');
   if (!columns.includes('is_pinned')) await run('ALTER TABLE messages ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0');
   await migrateAttachments();
+  await run(`CREATE TABLE IF NOT EXISTS file_deletions (
+    sha256 TEXT PRIMARY KEY CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    size INTEGER NOT NULL CHECK (size >= 0),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
   await run('PRAGMA foreign_keys = ON'); // attachments follow their entry when it is purged
   await fileStore.init();
+  try { await recordOrphanFiles(); } catch (error) { console.error('File inventory is incomplete:', error.message); }
+  await reconcileFileDeletions();
 }
 
 // message_id NULL = uploaded in the composer, not sent yet; such a row can only be claimed with the
@@ -160,12 +168,72 @@ function parseClaims(value) {
 
 async function verifyClaims(claims) {
   for (const { id, token } of claims) {
-    const row = await get('SELECT claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
-    if (!row || !tokenMatches(row.claim_hash, token)) throw httpError(409, 'An attached file is no longer available, attach it again');
+    const row = await get(`SELECT a.sha256, a.size, a.claim_hash, d.sha256 AS deleting
+      FROM attachments a LEFT JOIN file_deletions d ON d.sha256 = a.sha256
+      WHERE a.id = ? AND a.message_id IS NULL`, [id]);
+    if (!row || row.deleting || !tokenMatches(row.claim_hash, token) || !(await fileStore.isRegularFile(row.sha256, row.size))) {
+      throw httpError(409, 'An attached file is no longer available, attach it again');
+    }
   }
 }
 
+async function finishDeletionIntent(sha256) {
+  const owners = await all('SELECT id, message_id, size FROM attachments WHERE sha256 = ?', [sha256]);
+  if (owners.length) {
+    const pending = owners.filter(row => row.message_id === null);
+    // Inspect once before making any changes. An I/O error leaves the whole
+    // intent retryable; a bad recorded size says nothing about its siblings.
+    const size = pending.length ? await fileStore.readableSize(sha256) : null;
+    const keepBlob = pending.length < owners.length || pending.some(row => row.size === size);
+    await inTransaction(async () => {
+      for (const row of pending) {
+        if (row.size !== size) await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [row.id]);
+      }
+      if (keepBlob) await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
+    });
+    if (keepBlob) return false;
+  }
+  await fileStore.remove(sha256);
+  await run('DELETE FROM file_deletions WHERE sha256 = ?', [sha256]);
+  return true;
+}
+
+async function reconcileFileDeletions() {
+  const intents = await all('SELECT sha256 FROM file_deletions ORDER BY created_at, sha256');
+  for (const { sha256 } of intents) {
+    try { await finishDeletionIntent(sha256); } catch (error) { console.error(`File deletion retry failed for ${sha256}:`, error.message); }
+  }
+}
+
+async function recordOrphanFiles() {
+  for (const { sha256, size } of await fileStore.listStored()) {
+    const referenced = await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? LIMIT 1', [sha256]);
+    if (!referenced) await run('INSERT OR IGNORE INTO file_deletions (sha256, size) VALUES (?, ?)', [sha256, size]);
+  }
+}
+
+async function deletePendingUpload(id, token) {
+  return enqueueWrite(async () => {
+    const row = await get('SELECT sha256, claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+    if (!row || !tokenMatches(row.claim_hash, token)) return false;
+    const shared = await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? AND id != ? LIMIT 1', [row.sha256, id]);
+    if (shared) await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+    else await inTransaction(async () => {
+      await run('INSERT OR IGNORE INTO file_deletions (sha256, size) SELECT sha256, size FROM attachments WHERE id = ?', [id]);
+      await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+    });
+    if (!shared) try { await finishDeletionIntent(row.sha256); } catch (error) { console.error('Pending file deletion deferred:', error.message); }
+    return true;
+  });
+}
+
 function enqueueWrite(task) {
+  const queued = writeQueue.then(task);
+  writeQueue = queued.catch(() => {});
+  return queued;
+}
+
+function enqueueRead(task) {
   const queued = writeQueue.then(task);
   writeQueue = queued.catch(() => {});
   return queued;
@@ -205,32 +273,63 @@ async function loadEntry(id) {
 }
 
 // Each distinct file is counted once, whatever the number of entries pointing to it.
-async function filesBytesUsed() {
-  const row = await get('SELECT COALESCE(SUM(size), 0) AS bytes FROM (SELECT MAX(size) AS size FROM attachments GROUP BY sha256)');
-  return row.bytes;
+async function filesBytesUsed(excludeTmp = null) {
+  const rows = await all('SELECT sha256, size FROM attachments UNION ALL SELECT sha256, size FROM file_deletions');
+  const bytesByHash = new Map();
+  for (const { sha256, size } of [...rows, ...await fileStore.listStored()]) {
+    bytesByHash.set(sha256, Math.max(bytesByHash.get(sha256) || 0, size));
+  }
+  return [...bytesByHash.values()].reduce((total, size) => total + size, 0) + await fileStore.tmpBytes(excludeTmp);
 }
 
-// <img src="api/files/<id>/…"> (relative or absolute) inside entry HTML.
-const INLINE_FILE_SRC = /(<img\b[^>]*?\bsrc\s*=\s*)(["'])(?:[^"']*?\/)?api\/files\/(\d+)\/[^"']*\2/gi;
+async function fileMetadataCharge(sha256) {
+  const row = await get(`SELECT COALESCE(MAX(size), 0) AS size FROM (
+    SELECT size FROM attachments WHERE sha256 = ? UNION ALL SELECT size FROM file_deletions WHERE sha256 = ?
+  )`, [sha256, sha256]);
+  return row.size;
+}
+
+// Capture the src attribute, skipping quoted values of preceding attributes.
+const INLINE_FILE_SRC = /(<img(?=\s)(?:[^<>"']|"[^"]*"|'[^']*')*?\ssrc\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s<>"']+))/gi;
+
+function localInlineId(src, base) {
+  const url = URL.parse(src, base);
+  if (!url || url.origin !== base.origin || !url.pathname.startsWith(base.pathname)) return null;
+  const match = /^api\/files\/(\d+)\/[^/]+\/?$/i.exec(url.pathname.slice(base.pathname.length));
+  return match ? Number(match[1]) : null;
+}
 
 // Links the claimed uploads to a new entry: attachments as files, inlineUploads as images referenced by the HTML.
 // An image copied from another entry gets its own attachment row so each entry owns what it shows.
 // Another client's unsent upload is never linked, even if its id appears in the HTML.
-async function linkFiles(messageId, html, attachments, inlineUploads) {
+async function linkFiles(messageId, html, attachments, inlineUploads, baseUrl) {
   for (const { id } of attachments) {
     await run('UPDATE attachments SET message_id = ?, inline = 0, claim_hash = NULL WHERE id = ? AND message_id IS NULL', [messageId, id]);
   }
-  const claimedInline = new Set(inlineUploads.map((claim) => claim.id));
-  const referenced = [...new Set([...html.matchAll(INLINE_FILE_SRC)].map((match) => Number(match[3])))];
+  const unlinkedInline = new Set(inlineUploads.map((claim) => claim.id));
+  const base = baseUrl && URL.parse(baseUrl);
+  const localSources = new Map();
+  if (base) {
+    for (const [, , doubleQuoted, singleQuoted, unquoted] of html.matchAll(INLINE_FILE_SRC)) {
+      const src = doubleQuoted ?? singleQuoted ?? unquoted;
+      const id = localInlineId(src, base);
+      if (id !== null) localSources.set(src, id);
+    }
+  }
   const remap = new Map();
-  for (const fileId of referenced) {
+  for (const fileId of new Set(localSources.values())) {
     const row = await get('SELECT id, message_id, sha256, name, type, size FROM attachments WHERE id = ?', [fileId]);
-    if (!row || !isInlineImageType(row.type)) continue;
+    if (!row) throw httpError(409, 'An inline image is no longer available, paste it again');
+    if (!isInlineImageType(row.type)) continue;
     if (row.message_id === null) {
-      if (!claimedInline.has(fileId)) continue;
+      if (!unlinkedInline.has(fileId)) continue;
       await run('UPDATE attachments SET message_id = ?, inline = 1, claim_hash = NULL WHERE id = ?', [messageId, row.id]);
+      unlinkedInline.delete(fileId);
       remap.set(fileId, row);
     } else if (row.message_id !== messageId) {
+      if (!(await fileStore.isRegularFile(row.sha256, row.size))) {
+        throw httpError(409, 'An inline image is no longer available, paste it again');
+      }
       const copy = await run(
         'INSERT INTO attachments (message_id, sha256, name, type, size, inline) VALUES (?, ?, ?, ?, ?, 1)',
         [messageId, row.sha256, row.name, row.type, row.size],
@@ -238,9 +337,11 @@ async function linkFiles(messageId, html, attachments, inlineUploads) {
       remap.set(fileId, { ...row, id: copy.lastID });
     }
   }
+  if (unlinkedInline.size) throw httpError(409, 'An inline upload does not match an inline image in this entry');
   if (!remap.size) return html;
-  return html.replace(INLINE_FILE_SRC, (match, prefix, quote, fileId) => {
-    const row = remap.get(Number(fileId));
+  return html.replace(INLINE_FILE_SRC, (match, prefix, doubleQuoted, singleQuoted, unquoted) => {
+    const row = remap.get(localSources.get(doubleQuoted ?? singleQuoted ?? unquoted));
+    const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : '';
     return row ? `${prefix}${quote}${fileUrl(row.id, row.name)}${quote}` : match;
   });
 }
@@ -250,7 +351,7 @@ function entryId(value) {
 }
 
 // Inserts an entry with its files. Must run inside enqueueWrite + inTransaction; throws httpError on refusal.
-async function writeEntry(html, mono, attachments, inlineUploads) {
+async function writeEntry(html, mono, attachments, inlineUploads, baseUrl) {
   let currentDatabaseBytes;
   try {
     currentDatabaseBytes = databaseBytes();
@@ -262,20 +363,26 @@ async function writeEntry(html, mono, attachments, inlineUploads) {
   }
   await verifyClaims([...attachments, ...inlineUploads]);
   const result = await run('INSERT INTO messages (message, mono) VALUES (?, ?)', [html, mono ? 1 : 0]);
-  const linkedHtml = await linkFiles(result.lastID, html, attachments, inlineUploads);
+  const linkedHtml = await linkFiles(result.lastID, html, attachments, inlineUploads, baseUrl);
   if (linkedHtml !== html) await run('UPDATE messages SET message = ? WHERE id = ?', [linkedHtml, result.lastID]);
+  const linked = await get('SELECT COUNT(*) AS n FROM attachments WHERE message_id = ?', [result.lastID]);
+  if (linked.n > MAX_FILES_PER_ENTRY) throw httpError(400, `At most ${MAX_FILES_PER_ENTRY} files per entry`);
   return result.lastID;
 }
 
 // Validates, then writes the entry and links its files in one transaction. Returns { status, entry } or { status, error }.
-async function insertEntry(html, mono, attachments = [], inlineUploads = []) {
+async function insertEntry(html, mono, attachments = [], inlineUploads = [], baseUrl) {
   if (!html.trim() && !attachments.length) return { status: 400, error: 'Entry content is required' };
-  if (attachments.length > MAX_FILES_PER_ENTRY) return { status: 400, error: `At most ${MAX_FILES_PER_ENTRY} files per entry` };
+  const claimedFiles = new Set([...attachments, ...inlineUploads].map((claim) => claim.id));
+  if (claimedFiles.size > MAX_FILES_PER_ENTRY) return { status: 400, error: `At most ${MAX_FILES_PER_ENTRY} files per entry` };
   if (Buffer.byteLength(html, 'utf8') > MAX_ENTRY_BYTES) return { status: 413, error: 'Entry is too large' };
   if (hasOversizedImage(html)) return { status: 413, error: 'An embedded image is too large' };
   try {
-    const id = await enqueueWrite(() => inTransaction(() => writeEntry(html, mono, attachments, inlineUploads)));
-    return { status: 201, entry: await loadEntry(id) };
+    const entry = await enqueueWrite(async () => {
+      const id = await inTransaction(() => writeEntry(html, mono, attachments, inlineUploads, baseUrl));
+      return loadEntry(id);
+    });
+    return { status: 201, entry };
   } catch (error) {
     return { status: error.status || 500, error: error.status ? error.message : 'Unable to save entry' };
   }
@@ -285,14 +392,36 @@ async function insertEntry(html, mono, attachments = [], inlineUploads = []) {
 function purgeExpired() {
   return enqueueWrite(async () => {
     let removed = 0;
-    if (RETENTION_SECONDS > 0) {
-      removed += (await run("DELETE FROM messages WHERE created_at < datetime('now', ?) AND is_pinned = 0", [`-${RETENTION_SECONDS} seconds`])).changes;
-    }
-    // deleted_at is an ISO string ("…T…Z"); compare as dates, not text, or same-day rows never match datetime('now', …)
-    removed += (await run("DELETE FROM messages WHERE deleted_at IS NOT NULL AND julianday(deleted_at) < julianday('now', ?)", [`-${DELETED_ENTRY_PURGE_SECONDS} seconds`])).changes;
-    await run('DELETE FROM attachments WHERE message_id IS NOT NULL AND message_id NOT IN (SELECT id FROM messages)');
-    await run("DELETE FROM attachments WHERE message_id IS NULL AND julianday(created_at) < julianday('now', ?)", [`-${PENDING_UPLOAD_SECONDS} seconds`]);
-    const keep = new Set((await all('SELECT DISTINCT sha256 FROM attachments')).map((row) => row.sha256));
+    await inTransaction(async () => {
+      await run('CREATE TEMP TABLE IF NOT EXISTS purge_attachments (id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)');
+      await run('CREATE TEMP TABLE IF NOT EXISTS purge_messages (id INTEGER PRIMARY KEY)');
+      await run('DELETE FROM purge_attachments');
+      await run('DELETE FROM purge_messages');
+      const retentionClause = RETENTION_SECONDS > 0
+        ? "(m.created_at < datetime('now', ?) AND m.is_pinned = 0) OR "
+        : '';
+      const retentionParams = RETENTION_SECONDS > 0 ? [`-${RETENTION_SECONDS} seconds`] : [];
+      await run(`INSERT INTO purge_messages (id)
+        SELECT m.id FROM messages m WHERE ${retentionClause}(m.deleted_at IS NOT NULL AND julianday(m.deleted_at) < julianday('now', ?))`, [
+        ...retentionParams, `-${DELETED_ENTRY_PURGE_SECONDS} seconds`,
+      ]);
+      await run(`INSERT INTO purge_attachments (id, sha256, size)
+        SELECT a.id, a.sha256, a.size FROM attachments a
+        WHERE a.message_id IN (SELECT id FROM purge_messages)
+          OR (a.message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = a.message_id))
+          OR (a.message_id IS NULL AND julianday(a.created_at) < julianday('now', ?))`, [
+        `-${PENDING_UPLOAD_SECONDS} seconds`,
+      ]);
+      removed += (await run('DELETE FROM messages WHERE id IN (SELECT id FROM purge_messages)')).changes;
+      await run('DELETE FROM attachments WHERE id IN (SELECT id FROM purge_attachments)');
+      await run(`INSERT OR IGNORE INTO file_deletions (sha256, size)
+        SELECT p.sha256, MAX(p.size) FROM purge_attachments p
+        WHERE NOT EXISTS (SELECT 1 FROM attachments a WHERE a.sha256 = p.sha256)
+        GROUP BY p.sha256`);
+
+    });
+    await reconcileFileDeletions();
+    const keep = new Set((await all('SELECT sha256 FROM attachments UNION SELECT sha256 FROM file_deletions')).map((row) => row.sha256));
     const removedFiles = await fileStore.sweep(keep);
     await fileStore.cleanTmp(PENDING_UPLOAD_SECONDS * 1000);
     if (removed) {
@@ -383,15 +512,22 @@ async function receiveUpload(req) {
   const name = sanitizeFileName(req.params.name);
   const declared = Number.parseInt(req.headers['content-length'], 10);
   if (declared > MAX_FILE_BYTES) throw httpError(413, `File is larger than the ${formatBytes(MAX_FILE_BYTES)} limit`);
-  // The total-storage check happens after hashing: an identical file already stored takes no extra space.
-  let upload;
+  // The hash isn't known yet. Allow one admissible file's worth of staging
+  // across both PUT routes, independently of the post-hash retained quota.
+  const stage = await enqueueWrite(() => fileStore.reserve(declared, Math.min(MAX_FILE_BYTES, MAX_FILES_BYTES)));
+  if (stage.maxBytes === MAX_FILE_BYTES) stage.limitError = httpError(413, `File is larger than the ${formatBytes(MAX_FILE_BYTES)} limit`);
   try {
-    upload = await fileStore.receive(req, MAX_FILE_BYTES);
+    const upload = await fileStore.receive(req, stage);
+    return { upload, name, type: resolveType(name, req.headers['content-type'], upload.head) };
   } catch (error) {
-    if (error.status === 413) throw httpError(413, `File is larger than the ${formatBytes(MAX_FILE_BYTES)} limit`);
+    await enqueueWrite(() => discardUpload(stage.tmp));
     throw error;
   }
-  return { upload, name, type: resolveType(name, req.headers['content-type'], upload.head) };
+}
+
+async function discardUpload(tmp) {
+  try { await fileStore.discard(tmp); } catch (error) { console.error('Temporary upload cleanup deferred:', error.message); }
+  fileStore.reservations.delete(tmp); // any failed unlink is now charged by disk inventory
 }
 
 // Stores an upload atomically: rows are written in a transaction and the file is moved into place as the
@@ -402,8 +538,14 @@ function storeUpload({ upload, name, type }, createEntry) {
   return enqueueWrite(async () => {
     let added = false;
     try {
+      if (await get('SELECT 1 AS found FROM file_deletions WHERE sha256 = ?', [upload.sha256])) {
+        await finishDeletionIntent(upload.sha256);
+      }
       return await inTransaction(async () => {
-        if (!(await fileStore.exists(upload.sha256)) && (await filesBytesUsed()) + upload.size > MAX_FILES_BYTES) {
+        const used = await filesBytesUsed(fileStore.reservations);
+        const currentCharge = Math.max(await fileMetadataCharge(upload.sha256), await fileStore.storedSize(upload.sha256));
+        const projectedCharge = Math.max(await fileMetadataCharge(upload.sha256), upload.size);
+        if (used - currentCharge + projectedCharge > MAX_FILES_BYTES) {
           throw httpError(413, `File storage is full (${formatBytes(MAX_FILES_BYTES)})`);
         }
         const messageId = createEntry ? await writeEntry('', false, [], []) : null;
@@ -412,13 +554,15 @@ function storeUpload({ upload, name, type }, createEntry) {
           'INSERT INTO attachments (message_id, sha256, name, type, size, claim_hash) VALUES (?, ?, ?, ?, ?, ?)',
           [messageId, upload.sha256, name, type, upload.size, token && tokenHash(token)],
         );
-        added = await fileStore.commit(upload.tmp, upload.sha256);
+        added = await fileStore.commit(upload.tmp, upload.sha256, upload.size);
+        fileStore.reservations.delete(upload.tmp);
         return { id: row.lastID, token, messageId, name, type, size: upload.size, url: fileUrl(row.lastID, name) };
       });
     } catch (error) {
-      await fileStore.discard(upload.tmp);
+      await discardUpload(upload.tmp);
       if (added && !(await get('SELECT 1 AS found FROM attachments WHERE sha256 = ?', [upload.sha256]))) {
-        await fileStore.remove(upload.sha256);
+        await run('INSERT OR IGNORE INTO file_deletions (sha256, size) VALUES (?, ?)', [upload.sha256, upload.size]);
+        try { await finishDeletionIntent(upload.sha256); } catch (cleanupError) { console.error('Uploaded file cleanup deferred:', cleanupError.message); }
       }
       throw error;
     }
@@ -480,7 +624,7 @@ const VISIBLE_FILE = `SELECT a.id, a.sha256, a.name, a.type, a.size FROM attachm
 app.get('/api/files/:id/:name', async (req, res) => {
   const id = entryId(req.params.id);
   if (id === null) return res.status(404).type('text/plain').send('File not found\n');
-  return sendStoredFile(req, res, await get(`${VISIBLE_FILE} AND a.id = ?`, [id]));
+  return sendStoredFile(req, res, await enqueueRead(() => get(`${VISIBLE_FILE} AND a.id = ?`, [id])));
 });
 
 // Terminal download of the n-th file of an entry:  curl -skOJ https://<host>/clipboard/api/messages/12/files/1
@@ -488,17 +632,16 @@ app.get('/api/messages/:id/files/:index', async (req, res) => {
   const id = entryId(req.params.id);
   const index = entryId(req.params.index);
   if (id === null || !index) return res.status(404).type('text/plain').send('File not found\n');
-  return sendStoredFile(req, res, await get(`${VISIBLE_FILE} AND a.message_id = ? AND a.inline = 0 ORDER BY a.id LIMIT 1 OFFSET ?`, [id, index - 1]));
+  return sendStoredFile(req, res, await enqueueRead(() => get(`${VISIBLE_FILE} AND a.message_id = ? AND a.inline = 0 ORDER BY a.id LIMIT 1 OFFSET ?`, [id, index - 1])));
 });
 
 // Removes a composer upload that was not sent (the chip's ✕ button); needs its token in X-Upload-Token.
 app.delete('/api/files/:id', async (req, res) => {
   const id = entryId(req.params.id);
   if (id === null) return res.status(404).json({ error: 'File not found' });
-  const row = await get('SELECT claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
-  if (!row || !tokenMatches(row.claim_hash, req.get('x-upload-token'))) return res.status(404).json({ error: 'File not found' });
-  await enqueueWrite(() => run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]));
-  return res.status(204).send();
+  return (await deletePendingUpload(id, req.get('x-upload-token')))
+    ? res.status(204).send()
+    : res.status(404).json({ error: 'File not found' });
 });
 
 app.use(express.json({ limit: MAX_ENTRY_BYTES }));
@@ -513,7 +656,7 @@ app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
 
 app.get('/api/config', async (req, res) => {
   let filesBytesUsedNow = null;
-  try { filesBytesUsedNow = await filesBytesUsed(); } catch { /* reported as unknown */ }
+  try { filesBytesUsedNow = await enqueueRead(() => filesBytesUsed()); } catch { /* reported as unknown */ }
   res.set('Cache-Control', 'no-store');
   return res.json({
     retentionSeconds: RETENTION_SECONDS,
@@ -527,8 +670,10 @@ app.get('/api/config', async (req, res) => {
 
 app.get('/api/messages', async (req, res) => {
   try {
-    const rows = await all(`SELECT ${ENTRY_COLUMNS} FROM messages WHERE deleted_at IS NULL ORDER BY is_pinned DESC, id DESC`);
-    const files = await filesByEntry(rows.map((row) => row.id));
+    const { rows, files } = await enqueueRead(async () => {
+      const rows = await all(`SELECT ${ENTRY_COLUMNS} FROM messages WHERE deleted_at IS NULL ORDER BY is_pinned DESC, id DESC`);
+      return { rows, files: await filesByEntry(rows.map((row) => row.id)) };
+    });
     return res.json(rows.map((row) => toEntry(row, files.get(row.id) || [])));
   } catch {
     return res.status(500).json({ error: 'Unable to load entries' });
@@ -538,14 +683,23 @@ app.get('/api/messages', async (req, res) => {
 app.post('/api/messages', async (req, res) => {
   const text = typeof req.body?.text === 'string' ? req.body.text : '';
   // attachments / inlineUploads: [{ id, token }] as returned by PUT /api/files/<name>
-  const result = await insertEntry(text, req.body?.mono === true, parseClaims(req.body?.attachments), parseClaims(req.body?.inlineUploads));
+  const result = await insertEntry(text, req.body?.mono === true, parseClaims(req.body?.attachments), parseClaims(req.body?.inlineUploads), publicBase(req));
   if (result.error) return res.status(result.status).json({ error: result.error });
   return res.status(result.status).json(result.entry);
 });
 
-// Plain-text pull:  curl -sk https://<host>/clipboard/api/latest.txt   or   .../api/messages/<id>.txt
+function parsePublicBase(value) {
+  if (!value) return null;
+  const url = URL.parse(value);
+  if (!url || !/^https?:\/\//i.test(value) || url.username || url.password || /[?#\\]/.test(value)) {
+    throw new Error('PUBLIC_BASE_URL must be an absolute HTTP(S) app URL without credentials, query or fragment');
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, '')}/`;
+}
+
 // Absolute base URL as seen by the client, including a reverse-proxy prefix (Traefik StripPrefix sets X-Forwarded-Prefix).
 function publicBase(req) {
+  if (configuredPublicBase) return configuredPublicBase;
   const first = (value) => String(value || '').split(',')[0].trim();
   const proto = first(req.get('x-forwarded-proto')) || req.protocol;
   const host = first(req.get('x-forwarded-host')) || req.get('host');
@@ -555,10 +709,12 @@ function publicBase(req) {
 
 async function sendEntryText(req, res, sql, params) {
   try {
-    const row = await get(sql, params);
+    const { row, files } = await enqueueRead(async () => {
+      const row = await get(sql, params);
+      return { row, files: row ? (await filesByEntry([row.id])).get(row.id) || [] : [] };
+    });
     res.set('Cache-Control', 'no-store');
     if (!row) return res.status(404).type('text/plain').send('Entry not found\n');
-    const files = (await filesByEntry([row.id])).get(row.id) || [];
     const text = htmlToPlainText(row.message);
     const fileLines = files.map((file) => `[file] ${file.name} (${formatBytes(file.size)}) ${publicBase(req)}${file.url}`);
     return res.type('text/plain').send(`${[text, ...fileLines].filter(Boolean).join('\n')}\n`);
@@ -583,9 +739,12 @@ app.patch('/api/messages/:id', async (req, res) => {
     if (typeof req.body.mono === 'boolean') { updates.push('mono = ?'); params.push(req.body.mono ? 1 : 0); }
     if (typeof req.body.is_pinned === 'boolean') { updates.push('is_pinned = ?'); params.push(req.body.is_pinned ? 1 : 0); }
     params.push(id);
-    const result = await run(`UPDATE messages SET ${updates.join(', ')} WHERE id = ? AND deleted_at IS NULL`, params);
-    if (!result.changes) return res.status(404).json({ error: 'Entry not found' });
-    return res.json(await loadEntry(id));
+    const entry = await enqueueWrite(async () => {
+      const result = await run(`UPDATE messages SET ${updates.join(', ')} WHERE id = ? AND deleted_at IS NULL`, params);
+      return result.changes ? loadEntry(id) : null;
+    });
+    if (!entry) return res.status(404).json({ error: 'Entry not found' });
+    return res.json(entry);
   } catch {
     return res.status(500).json({ error: 'Unable to update entry' });
   }
@@ -596,7 +755,7 @@ app.delete('/api/messages/:id', async (req, res) => {
   const id = entryId(req.params.id);
   if (id === null) return res.status(400).json({ error: 'Invalid entry id' });
   try {
-    const result = await run("UPDATE messages SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND deleted_at IS NULL", [id]);
+    const result = await enqueueWrite(() => run("UPDATE messages SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND deleted_at IS NULL", [id]));
     if (!result.changes) return res.status(404).json({ error: 'Entry not found' });
     return res.status(204).send();
   } catch {
@@ -608,12 +767,15 @@ app.put('/api/messages/:id/restore', async (req, res) => {
   const id = entryId(req.params.id);
   if (id === null) return res.status(400).json({ error: 'Invalid entry id' });
   try {
-    const result = await run(
-      "UPDATE messages SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL AND julianday(deleted_at) > julianday('now', ?)",
-      [id, `-${RESTORE_WINDOW_SECONDS} seconds`],
-    );
-    if (!result.changes) return res.status(404).json({ error: 'Entry not found' });
-    return res.json(await loadEntry(id));
+    const entry = await enqueueWrite(async () => {
+      const result = await run(
+        "UPDATE messages SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL AND julianday(deleted_at) > julianday('now', ?)",
+        [id, `-${RESTORE_WINDOW_SECONDS} seconds`],
+      );
+      return result.changes ? loadEntry(id) : null;
+    });
+    if (!entry) return res.status(404).json({ error: 'Entry not found' });
+    return res.json(entry);
   } catch {
     return res.status(500).json({ error: 'Unable to restore entry' });
   }
@@ -633,8 +795,8 @@ initDatabase()
   .then(async () => {
     await purgeExpired();
     setInterval(purgeExpired, PURGE_INTERVAL_MS).unref();
-    app.listen(port, () => console.log(
-      `Clippy listening on port ${port} (retention ${formatDuration(RETENTION_SECONDS)}, files up to ${formatBytes(MAX_FILE_BYTES)} each, ${formatBytes(MAX_FILES_BYTES)} total in ${FILES_PATH})`,
+    const listener = app.listen(port, () => console.log(
+      `Clippy listening on port ${listener.address().port} (retention ${formatDuration(RETENTION_SECONDS)}, files up to ${formatBytes(MAX_FILE_BYTES)} each, ${formatBytes(MAX_FILES_BYTES)} total in ${FILES_PATH})`,
     ));
   })
   .catch((error) => {

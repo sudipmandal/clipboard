@@ -10,29 +10,29 @@
       @drop="onDrop"
     >
       <div class="editor-toolbar" role="toolbar" aria-label="Text formatting">
-        <button v-for="tool in tools" :key="tool.command" class="tool-button" type="button" :aria-label="tool.label" :title="tool.label" @click="applyFormat(tool)">
+        <button v-for="tool in tools" :key="tool.command" class="tool-button" type="button" :disabled="sending" :aria-label="tool.label" :title="tool.label" @click="applyFormat(tool)">
           <i :class="tool.icon" aria-hidden="true"></i>
         </button>
         <span class="toolbar-divider" aria-hidden="true"></span>
-        <button class="tool-button" type="button" aria-label="Insert link" title="Insert link" @click="insertLink">
+        <button class="tool-button" type="button" :disabled="sending" aria-label="Insert link" title="Insert link" @click="insertLink">
           <i class="bi bi-link-45deg" aria-hidden="true"></i>
         </button>
-        <button class="tool-button" type="button" aria-label="Insert image" title="Insert image" @click="openImagePicker">
+        <button class="tool-button" type="button" :disabled="sending" aria-label="Insert image" title="Insert image" @click="openImagePicker">
           <i class="bi bi-image" aria-hidden="true"></i>
         </button>
-        <button class="tool-button" type="button" aria-label="Attach files" title="Attach files" @click="$refs.fileInput.click()">
+        <button class="tool-button" type="button" :disabled="sending" aria-label="Attach files" title="Attach files" @click="$refs.fileInput.click()">
           <i class="bi bi-paperclip" aria-hidden="true"></i>
         </button>
-        <button class="tool-button" type="button" aria-label="Clear formatting" title="Clear formatting" @click="applyFormat({ command: 'removeFormat' })">
+        <button class="tool-button" type="button" :disabled="sending" aria-label="Clear formatting" title="Clear formatting" @click="applyFormat({ command: 'removeFormat' })">
           <i class="bi bi-eraser" aria-hidden="true"></i>
         </button>
-        <input ref="imageInput" class="visually-hidden" type="file" accept="image/*" tabindex="-1" aria-hidden="true" @change="insertImage">
-        <input ref="fileInput" class="visually-hidden" type="file" multiple tabindex="-1" aria-hidden="true" @change="onFilesPicked">
+        <input ref="imageInput" class="visually-hidden" type="file" accept="image/*" :disabled="sending" tabindex="-1" aria-hidden="true" @change="insertImage">
+        <input ref="fileInput" class="visually-hidden" type="file" multiple :disabled="sending" tabindex="-1" aria-hidden="true" @change="onFilesPicked">
       </div>
       <div
         ref="editor"
         class="rich-editor"
-        contenteditable="true"
+        :contenteditable="!sending"
         role="textbox"
         aria-label="Rich text editor"
         aria-multiline="true"
@@ -54,11 +54,11 @@
       <li v-for="item in attachments" :key="item.key" class="composer-file" :class="`is-${item.status}`">
         <i :class="['bi', fileIcon(item.type, item.name)]" aria-hidden="true"></i>
         <span class="composer-file-name" :title="item.name">{{ item.name }}</span>
-        <span class="composer-file-meta">{{ item.status === 'error' ? item.error : formatBytes(item.size) }}</span>
+        <span class="composer-file-meta"><template v-if="item.status === 'queued'">Queued · </template>{{ item.status === 'error' ? item.error : formatBytes(item.size) }}</span>
         <span v-if="item.status === 'uploading'" class="composer-file-progress" role="progressbar" :aria-valuenow="Math.round(item.progress * 100)" aria-valuemin="0" aria-valuemax="100" :aria-label="`Uploading ${item.name}`">
           <span :style="{ width: `${Math.round(item.progress * 100)}%` }"></span>
         </span>
-        <button class="composer-file-remove" type="button" :aria-label="`Remove ${item.name}`" @click="removeAttachment(item)">
+        <button class="composer-file-remove" type="button" :disabled="sending" :aria-label="`Remove ${item.name}`" @click="removeAttachment(item)">
           <i class="bi bi-x-lg" aria-hidden="true"></i>
         </button>
       </li>
@@ -100,7 +100,9 @@ export default {
       errorMessage: '',
       dragging: false,
       attachments: [],
+      drainingUploads: false,
       savedRange: null,
+      pendingCleanupClaims: [],
       tools: [
         { command: 'bold', label: 'Bold', icon: 'bi bi-type-bold' },
         { command: 'italic', label: 'Italic', icon: 'bi bi-type-italic' },
@@ -116,13 +118,16 @@ export default {
       return Boolean(text || /<img\b/i.test(this.message));
     },
     uploading() {
-      return this.attachments.some((item) => item.status === 'uploading');
+      return this.attachments.some((item) => item.status === 'queued' || item.status === 'uploading');
     },
     readyAttachments() {
       return this.attachments.filter((item) => item.status === 'done');
     },
+    hasAttachmentErrors() {
+      return this.attachments.some((item) => item.status === 'error');
+    },
     canSend() {
-      return !this.sending && !this.uploading && (this.hasContent || this.readyAttachments.length > 0);
+      return !this.sending && !this.uploading && !this.hasAttachmentErrors && (this.hasContent || this.readyAttachments.length > 0);
     },
     storageFree() {
       if (!this.limits || typeof this.limits.filesBytesUsed !== 'number') return null;
@@ -134,6 +139,7 @@ export default {
   },
   beforeUnmount() {
     this.attachments.forEach((item) => item.handle?.abort());
+    this.attachments = []; // Drop queued files before the aborted upload settles.
     this.inlineBlobs.forEach((file, url) => URL.revokeObjectURL(url));
   },
   methods: {
@@ -145,6 +151,7 @@ export default {
     onDragOver(event) {
       if (!this.hasFiles(event)) return; // keep normal text drag-and-drop inside the editor
       event.preventDefault();
+      if (this.sending) { this.dragging = false; return; }
       event.dataTransfer.dropEffect = 'copy';
       this.dragging = true;
     },
@@ -152,9 +159,10 @@ export default {
       if (!this.$refs.dropZone.contains(event.relatedTarget)) this.dragging = false;
     },
     onDrop(event) {
-      if (!this.hasFiles(event)) return;
-      event.preventDefault();
       this.dragging = false;
+      if (!this.hasFiles(event)) return;
+      event.preventDefault(); // Never let a rejected file drop navigate away from the draft.
+      if (this.sending) return;
       this.addFiles(event.dataTransfer.files);
     },
     onFilesPicked(event) {
@@ -162,11 +170,12 @@ export default {
       event.target.value = '';
     },
     addFiles(fileList) {
+      if (this.sending) return;
       this.errorMessage = '';
       const maxFile = this.limits?.maxFileBytes ?? Infinity;
       const maxCount = this.limits?.maxFilesPerEntry ?? Infinity;
       for (const file of Array.from(fileList || [])) {
-        const item = { key: (attachmentKey += 1), name: file.name, size: file.size, type: file.type, status: 'uploading', progress: 0, error: '', id: null, token: null, handle: null };
+        const item = { key: (attachmentKey += 1), name: file.name, size: file.size, type: file.type, status: 'queued', progress: 0, error: '', id: null, token: null, handle: null };
         this.attachments.push(item);
         const live = this.attachments[this.attachments.length - 1]; // reactive proxy
         if (this.attachments.filter((entry) => entry.status !== 'error').length > maxCount) {
@@ -174,20 +183,36 @@ export default {
         } else if (file.size > maxFile) {
           Object.assign(live, { status: 'error', error: `Larger than ${formatBytes(maxFile)}` });
         } else {
-          this.startUpload(live, file);
+          live.file = file;
         }
       }
+      this.drainUploads();
     },
-    startUpload(item, file) {
-      item.handle = uploadFile(file, file.name, (progress) => { item.progress = progress; });
-      item.handle.promise
-        .then((stored) => Object.assign(item, { status: 'done', id: stored.id, token: stored.token, type: stored.type, progress: 1 }))
-        .catch((error) => {
-          if (error.cancelled) return;
-          Object.assign(item, { status: 'error', error: error.message });
-        })
-        .finally(() => { item.handle = null; });
-      this.statusMessage = `Uploading ${file.name}`;
+    async drainUploads() {
+      if (this.drainingUploads) return;
+      this.drainingUploads = true;
+      try {
+        let item;
+        while ((item = this.attachments.find(entry => entry.status === 'queued'))) {
+          await this.startUpload(item);
+        }
+      } finally {
+        this.drainingUploads = false;
+      }
+    },
+    async startUpload(item) {
+      item.status = 'uploading';
+      this.statusMessage = `Uploading ${item.name}`;
+      try {
+        item.handle = uploadFile(item.file, item.name, progress => { item.progress = progress; });
+        const stored = await item.handle.promise;
+        Object.assign(item, { status: 'done', id: stored.id, token: stored.token, type: stored.type, progress: 1 });
+      } catch (error) {
+        if (!error.cancelled) Object.assign(item, { status: 'error', error: error.message });
+      } finally {
+        item.handle = null;
+        item.file = null;
+      }
     },
     removeAttachment(item) {
       item.handle?.abort();
@@ -217,7 +242,7 @@ export default {
     },
     // Uploads every blob:/data: image of the editor HTML and points it to its stored file.
     // Returns the rewritten HTML and the [{ id, token }] claims the server needs to link the images.
-    async uploadInlineImages(html) {
+    async uploadInlineImages(html, uploadedClaims = []) {
       const doc = new DOMParser().parseFromString(html, 'text/html');
       const claims = [];
       for (const image of doc.querySelectorAll('img')) {
@@ -230,7 +255,9 @@ export default {
         const name = blob.name || `pasted-image.${imageExtension(blob.type)}`;
         const stored = await uploadFile(blob, name).promise;
         image.setAttribute('src', stored.url);
-        claims.push({ id: stored.id, token: stored.token });
+        const claim = { id: stored.id, token: stored.token };
+        claims.push(claim);
+        uploadedClaims.push(claim);
       }
       return { html: doc.body.innerHTML, claims };
     },
@@ -289,8 +316,11 @@ export default {
       this.sending = true;
       this.errorMessage = '';
       this.statusMessage = 'Saving entry';
+      let inlineClaims = [];
       try {
-        const { html, claims } = this.hasContent ? await this.uploadInlineImages(this.message) : { html: '', claims: [] };
+        await this.cleanupClaims(this.pendingCleanupClaims);
+        const { html, claims } = this.hasContent ? await this.uploadInlineImages(this.message, inlineClaims) : { html: '', claims: [] };
+        inlineClaims = claims;
         const response = await fetch('api/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -315,12 +345,25 @@ export default {
         this.inlineBlobs.clear();
         this.statusMessage = 'Entry saved';
       } catch (error) {
+        await this.cleanupClaims(inlineClaims);
         console.error('Unable to save entry:', error);
         this.errorMessage = `Not saved: ${error.message}`;
         this.statusMessage = 'Unable to save entry';
       } finally {
         this.sending = false;
       }
+    },
+    async cleanupClaims(claims) {
+      if (!claims.length) return;
+      const outstanding = new Map(this.pendingCleanupClaims.map((claim) => [claim.id, claim]));
+      claims.forEach((claim) => outstanding.set(claim.id, claim));
+      await Promise.all([...outstanding.values()].map(async ({ id, token }) => {
+        try {
+          const response = await fetch(`api/files/${id}`, { method: 'DELETE', headers: { 'X-Upload-Token': token } });
+          if (response.ok || response.status === 404) outstanding.delete(id);
+        } catch { /* retained for retry */ }
+      }));
+      this.pendingCleanupClaims = [...outstanding.values()];
     },
   },
 };

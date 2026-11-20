@@ -80,6 +80,7 @@ class FileStore {
   constructor(root) {
     this.root = path.resolve(root); // res.sendFile needs absolute paths
     this.tmpDir = path.join(root, '.tmp');
+    this.reservations = new Map(); // tmp path -> maximum writable bytes until commit or discard
   }
 
   async init() {
@@ -92,10 +93,24 @@ class FileStore {
     return path.join(this.root, sha256.slice(0, 2), sha256);
   }
 
-  // Streams the request body to a temporary file while hashing it. Rejects with status 413 past maxBytes.
-  receive(req, maxBytes) {
+  // Called on the server's write queue, like commit and discard. Unowned temps
+  // (including failed unlinks) consume headroom; count owned paths by reservation.
+  async reserve(declared, headroom) {
+    let available = headroom - await this.tmpBytes(this.reservations);
+    for (const bytes of this.reservations.values()) available -= bytes;
+    const limitError = this.reservations.size ? httpError(503, 'Upload staging is busy; retry later')
+      : httpError(413, 'Upload exceeds available staging space');
+    if (declared > available || (available <= 0 && declared !== 0)) throw limitError;
+    const maxBytes = Number.isFinite(declared) ? declared : available;
     const tmp = path.join(this.tmpDir, crypto.randomUUID());
+    this.reservations.set(tmp, maxBytes);
+    return { tmp, maxBytes, limitError };
+  }
+
+  // Stream outside the write queue, enforcing the reservation on actual bytes.
+  receive(req, { tmp, maxBytes, limitError }) {
     return new Promise((resolve, reject) => {
+      if (req.destroyed) return reject(httpError(400, 'Upload interrupted'));
       const hash = crypto.createHash('sha256');
       const out = fs.createWriteStream(tmp, { flags: 'wx' });
       const headChunks = [];
@@ -106,15 +121,15 @@ class FileStore {
         if (settled) return;
         settled = true;
         req.unpipe(out);
-        // remove the partial file only once the stream has closed (it may still be opening)
-        out.once('close', () => fsp.rm(tmp, { force: true }).catch(() => {}));
+        // Keep the reservation until the writer has closed and discard has run.
+        out.once('close', () => reject(error));
         out.destroy();
-        reject(error);
       };
       req.on('data', (chunk) => {
+        if (settled) return;
         size += chunk.length;
         if (size > maxBytes) {
-          fail(httpError(413, 'File is too large'));
+          fail(limitError);
           return;
         }
         hash.update(chunk);
@@ -139,17 +154,74 @@ class FileStore {
     try {
       await fsp.access(this.pathFor(sha256));
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (error.code === 'ENOENT') return false;
+      throw error;
     }
   }
 
+  // null means confirmed missing or non-regular. Inspection errors must reach
+  // callers: recovery cannot retire an owner based on an unknown size.
+  async readableSize(sha256) {
+    try {
+      const target = this.pathFor(sha256);
+      const stat = await fsp.stat(target);
+      if (!stat.isFile()) return null;
+      const handle = await fsp.open(target, 'r');
+      await handle.close();
+      return stat.size;
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  async isRegularFile(sha256, size) {
+    return (await this.readableSize(sha256)) === size;
+  }
+
+  async storedSize(sha256) {
+    try {
+      const stat = await fsp.stat(this.pathFor(sha256));
+      if (!stat.isFile()) throw Object.assign(new Error('Stored blob is not a regular file'), { code: 'EFTYPE' });
+      return stat.size;
+    } catch (error) {
+      if (error.code === 'ENOENT') return 0;
+      throw error;
+    }
+  }
+
+  async tmpBytes(exclude = null) {
+    let total = 0;
+    for (const file of await fsp.readdir(this.tmpDir)) {
+      const full = path.join(this.tmpDir, file);
+      if (exclude?.has(full)) continue;
+      let stat;
+      try {
+        stat = await fsp.stat(full);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        // Cleanup can unlink a temp after readdir. A missing .tmp or a
+        // still-listed child (e.g. a dangling symlink) is not that race.
+        if ((await fsp.readdir(this.tmpDir)).includes(file)) throw error;
+        continue;
+      }
+      if (!stat.isFile()) throw new Error('Temp inventory contains a non-regular file');
+      total += stat.size;
+    }
+    return total;
+  }
+
   // Moves an upload into place; if the same content is already stored, the upload is simply dropped.
-  async commit(tmp, sha256) {
+  async commit(tmp, sha256, size) {
     const target = this.pathFor(sha256);
-    if (await this.exists(sha256)) {
-      await fsp.rm(tmp, { force: true });
-      return false;
+    if (await this.isRegularFile(sha256, size)) {
+      const existing = crypto.createHash('sha256');
+      for await (const chunk of fs.createReadStream(target)) existing.update(chunk);
+      if (existing.digest('hex') === sha256) {
+        await fsp.rm(tmp, { force: true });
+        return false;
+      }
     }
     await fsp.mkdir(path.dirname(target), { recursive: true });
     await fsp.rename(tmp, target);
@@ -173,6 +245,24 @@ class FileStore {
     } finally {
       await handle.close();
     }
+  }
+
+  async listStored() {
+    const stored = [];
+    let dirs;
+    try { dirs = await fsp.readdir(this.root); } catch (error) {
+      if (error.code === 'ENOENT') return stored;
+      throw error;
+    }
+    for (const dir of dirs) {
+      if (!/^[0-9a-f]{2}$/.test(dir)) continue;
+      for (const file of await fsp.readdir(path.join(this.root, dir))) {
+        if (!SHA256.test(file) || !file.startsWith(dir)) continue;
+        const stat = await fsp.stat(path.join(this.root, dir, file));
+        if (stat?.isFile()) stored.push({ sha256: file, size: stat.size });
+      }
+    }
+    return stored;
   }
 
   // Deletes stored files whose hash is not in `keep`. Returns the number of files removed.
@@ -202,8 +292,14 @@ class FileStore {
     const files = await fsp.readdir(this.tmpDir).catch(() => []);
     for (const file of files) {
       const full = path.join(this.tmpDir, file);
-      const stat = await fsp.stat(full).catch(() => null);
-      if (stat && now - stat.mtimeMs >= maxAgeMs) await fsp.rm(full, { force: true });
+      if (this.reservations.has(full)) continue;
+      try {
+        const stat = await fsp.stat(full);
+        if (now - stat.mtimeMs >= maxAgeMs) await fsp.rm(full, { force: true });
+      } catch (error) {
+        // Best effort only: tmpBytes still inventories stranded files for admission.
+        if (error.code !== 'ENOENT') console.warn('Temp cleanup deferred:', error.message);
+      }
     }
   }
 }

@@ -1,6 +1,7 @@
 // Display-only link helpers: a small ↗ icon after every web address so it opens in a new tab.
 // The stored entry is never changed, so copying an entry still gives exactly what was pasted.
 
+// Collect the whole token before deciding which punctuation belongs to prose.
 const URL_CANDIDATE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
 const CLOSERS = { ')': '(', ']': '[', '}': '{' };
 
@@ -29,12 +30,32 @@ export function isWebUrl(value) {
   }
 }
 
+// A pipe or backslash before a scheme usually joins two prose links. If the
+// query or fragment already contains a literal HTTP(S) URL, prefer a nested
+// URL list and keep the rest of the token. Use whitespace to separate prose
+// links unambiguously in that case.
+function* splitAdjacentUrls(token) {
+  let start = 0;
+  for (const separator of token.matchAll(/[|\\](?=https?:\/\/)/gi)) {
+    const left = token.slice(start, separator.index);
+    const component = left.search(/[?#]/);
+    if (component !== -1 && /https?:\/\//i.test(left.slice(component + 1))) break;
+    yield left;
+    start = separator.index + 1;
+  }
+  yield token.slice(start);
+}
+
 // Web addresses in plain text: [{ start, end, url }]
 export function findUrls(text) {
   const found = [];
   for (const match of String(text).matchAll(URL_CANDIDATE)) {
-    const url = trimUrl(match[0]);
-    if (isWebUrl(url)) found.push({ start: match.index, end: match.index + url.length, url });
+    let offset = 0;
+    for (const candidate of splitAdjacentUrls(match[0])) {
+      const url = trimUrl(candidate);
+      if (isWebUrl(url)) found.push({ start: match.index + offset, end: match.index + offset + url.length, url });
+      offset += candidate.length + 1;
+    }
   }
   return found;
 }

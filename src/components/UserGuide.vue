@@ -22,9 +22,9 @@
         <section>
           <h3><i class="bi bi-paperclip" aria-hidden="true"></i> Files</h3>
           <ul>
-            <li>Drop files onto <strong>Compose</strong> or click <i class="bi bi-paperclip" aria-label="the paperclip"></i>, then send: the files are attached to the new entry, with or without text.</li>
+            <li>Drop files onto <strong>Compose</strong> or click <strong>Attach files</strong> <i class="bi bi-paperclip" aria-hidden="true"></i>, then send: the files are attached to the new entry, with or without text.</li>
             <li v-if="limits">Up to <strong>{{ formatBytes(limits.maxFileBytes) }}</strong> per file and {{ limits.maxFilesPerEntry }} files per entry<template v-if="typeof limits.filesBytesUsed === 'number'">; <strong>{{ formatBytes(Math.max(0, limits.maxFilesBytes - limits.filesBytesUsed)) }}</strong> of {{ formatBytes(limits.maxFilesBytes) }} storage free</template>. The same limits are shown under the composer.</li>
-            <li>Click a file name to download it. <i class="bi bi-terminal" aria-label="The terminal button"></i> copies a <code>curl</code> command to download it on another machine.</li>
+            <li>Click a file name to download it. The terminal button <i class="bi bi-terminal" aria-hidden="true"></i> copies a <code>curl</code> command to download it on another machine.</li>
             <li>Files are deleted together with their entry, including by automatic retention. Pinned entries keep their files.</li>
           </ul>
         </section>

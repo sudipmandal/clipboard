@@ -127,12 +127,15 @@ labels:
   - "traefik.http.services.clipboard.loadbalancer.server.port=3000"
 ```
 
+Traefik's `StripPrefix` supplies `X-Forwarded-Prefix`. If your proxy strips the path **without** sending that header, set `PUBLIC_BASE_URL=https://host.example/clipboard/` in the **Clippy backend environment** and restart it. Use the exact URL users open, including any non-default port and the full mount path. Clippy uses this base instead of the request headers to recognize copied local images and generate download links in `.txt` responses. Images from other origins or outside the mount path are not treated as local files. Direct LAN deployments at `/` do not need this setting.
+
 Traefik does not limit request body size by default. With nginx, raise `client_max_body_size` to at least `MAX_FILE_BYTES` for file uploads.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `PUBLIC_BASE_URL` | From request headers | Public HTTP(S) URL of the app, including its proxy prefix; omit credentials, query and fragment. |
 | `RETENTION_TIME` | `0` (keep forever) | Delete unpinned entries older than this: `90m`, `36h`, `10d`, `2w`; a bare number means days. Pinned entries are exempt until unpinned. |
 | `MAX_ENTRY_BYTES` | `10485760` | Maximum size of one entry |
 | `MAX_IMAGE_BYTES` | `5242880` | Maximum size of an image embedded as a `data:` URI by API clients (the web page stores images as files) |
@@ -145,9 +148,9 @@ Traefik does not limit request body size by default. With nginx, raise `client_m
 
 ## Release
 
-Current application version: **1.6.0**. This release adds disk-backed file attachments and pasted-image storage, safe new-tab controls for web addresses, filename-aware search and refresh, and reliable cleanup for soft-deleted entries. Pending uploads use private claim tokens, image content is validated before inline display, and file/database writes are failure-safe.
+Current application version: **1.6.1**. This hotfix enforces file-count and physical-storage limits across attached and inline files, prevents composer changes or failed files from being silently discarded during save, cleans failed inline uploads immediately, and separates adjacent web addresses while preserving embedded URL lists in query strings and fragments. The user guide names its file controls in text, including for screen readers. A copied local image whose source has expired is rejected rather than saved as a broken link. File recovery preserves pending owners when storage cannot be inspected; failed temporary-file cleanup is retried and its bytes still count toward the quota. On re-upload, deduplication verifies the existing blob’s SHA-256 and repairs mismatched bytes. Ordinary downloads do not rehash the file. `MAX_FILES_BYTES` limits retained file data; for one server process per store, allow additional temporary space of `min(MAX_FILE_BYTES, MAX_FILES_BYTES)` for streaming, plus SQLite and filesystem overhead. Concurrent uploads share that staging space; retry HTTP 503 when it is busy.
 
-Pushing a semantic-version tag such as `v1.6.0` starts the GitHub Actions workflow. The tag build publishes the multi-architecture Docker image and creates a GitHub Release with generated release notes. GitHub automatically provides source-code archives in `.zip` and `.tar.gz` formats for the tag.
+Pushing a semantic-version tag such as `v1.6.1` starts the GitHub Actions workflow. The tag build publishes the multi-architecture Docker image and creates a GitHub Release with generated release notes. GitHub automatically provides source-code archives in `.zip` and `.tar.gz` formats for the tag.
 
 ## Security
 
