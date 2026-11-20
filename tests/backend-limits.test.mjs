@@ -24,6 +24,8 @@ async function startServer(extraEnv = {}, existingRoot = null) {
       ...process.env,
       PORT: String(port),
       DATABASE_PATH: path.join(root, 'database.sqlite'),
+      FILES_PATH: path.join(root, 'files'),
+      LEGACY_DATABASE_PATH: path.join(root, 'no-legacy.sqlite'),
       DIST_PATH: dist,
       ...extraEnv,
     },

@@ -335,16 +335,15 @@ export default {
     },
     async cleanupClaims(claims) {
       if (!claims.length) return;
-      const failed = [];
-      await Promise.all(claims.map(async ({ id, token }) => {
+      const outstanding = new Map(this.pendingCleanupClaims.map((claim) => [claim.id, claim]));
+      claims.forEach((claim) => outstanding.set(claim.id, claim));
+      await Promise.all([...outstanding.values()].map(async ({ id, token }) => {
         try {
           const response = await fetch(`api/files/${id}`, { method: 'DELETE', headers: { 'X-Upload-Token': token } });
-          if (!response.ok && response.status !== 404) failed.push({ id, token });
-        } catch {
-          failed.push({ id, token });
-        }
+          if (response.ok || response.status === 404) outstanding.delete(id);
+        } catch { /* retained for retry */ }
       }));
-      this.pendingCleanupClaims = failed;
+      this.pendingCleanupClaims = [...outstanding.values()];
     },
   },
 };

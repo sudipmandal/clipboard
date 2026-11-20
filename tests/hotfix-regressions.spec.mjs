@@ -60,25 +60,40 @@ test('partial inline upload batch is cleaned when a later upload fails', async (
   await expect.poll(async () => (await request.get(created[0].url)).status()).toBe(404);
 });
 
-// B5: failed cleanup remains queued and is retried on the next send attempt.
-test('failed inline cleanup is retried on the next save', async ({ page }) => {
-  let cleanupAttempts = 0;
+// B5: failures for older claims remain queued even when newer cleanup succeeds.
+test('older failed inline cleanup survives later successful cleanup and is retried', async ({ page }) => {
+  const uploadedIds = [];
+  const deleteIds = [];
+  let blockOldCleanup = true;
   await page.route('**/api/messages', async (route) => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'save unavailable' }) }));
   await page.route('**/api/files/**', async (route) => {
-    if (route.request().method() !== 'DELETE') return route.continue();
-    cleanupAttempts += 1;
-    if (cleanupAttempts === 1) return route.fulfill({ status: 503, body: 'cleanup unavailable' });
+    const request = route.request();
+    if (request.method() === 'PUT') {
+      const response = await route.fetch();
+      uploadedIds.push(String((await response.json()).id));
+      return route.fulfill({ response });
+    }
+    if (request.method() !== 'DELETE') return route.continue();
+    const id = new URL(request.url()).pathname.split('/').pop();
+    deleteIds.push(id);
+    if (blockOldCleanup && id === uploadedIds[0]) return route.fulfill({ status: 503, body: 'cleanup unavailable' });
     return route.continue();
   });
   const editor = page.getByRole('textbox', { name: 'Rich text editor' });
-  await editor.evaluate((element) => {
+  const setImage = () => editor.evaluate((element) => {
     element.innerHTML = '<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=">';
     element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' }));
   });
+  await setImage();
   await page.locator('.send-button').click();
   await expect(page.locator('.composer-error')).toBeVisible();
+  await setImage();
   await page.locator('.send-button').click();
-  await expect.poll(() => cleanupAttempts).toBeGreaterThanOrEqual(2);
+  await expect.poll(() => uploadedIds.length).toBe(2);
+  blockOldCleanup = false;
+  await setImage();
+  await page.locator('.send-button').click();
+  await expect.poll(() => deleteIds.filter((id) => id === uploadedIds[0]).length).toBeGreaterThanOrEqual(3);
 });
 
 // B3: rejected file drops must not leave the drag overlay stuck over the composer.

@@ -160,8 +160,10 @@ function parseClaims(value) {
 
 async function verifyClaims(claims) {
   for (const { id, token } of claims) {
-    const row = await get('SELECT claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
-    if (!row || !tokenMatches(row.claim_hash, token)) throw httpError(409, 'An attached file is no longer available, attach it again');
+    const row = await get('SELECT sha256, claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+    if (!row || !tokenMatches(row.claim_hash, token) || !(await fileStore.exists(row.sha256))) {
+      throw httpError(409, 'An attached file is no longer available, attach it again');
+    }
   }
 }
 
@@ -169,25 +171,20 @@ async function deletePendingUpload(id, token) {
   return enqueueWrite(async () => {
     const row = await get('SELECT sha256, claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
     if (!row || !tokenMatches(row.claim_hash, token)) return false;
-    let staged = null;
-    await run('BEGIN IMMEDIATE');
-    try {
-      await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
-      if (!(await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? LIMIT 1', [row.sha256]))) {
-        staged = await fileStore.stageRemove(row.sha256);
-      }
-      await run('COMMIT');
-    } catch (error) {
-      await run('ROLLBACK').catch(() => {});
-      await fileStore.restoreStaged(staged, row.sha256).catch(() => {});
-      throw error;
-    }
-    await fileStore.discardStaged(staged).catch(() => {});
+    const shared = await get('SELECT 1 AS found FROM attachments WHERE sha256 = ? AND id != ? LIMIT 1', [row.sha256, id]);
+    if (!shared) await fileStore.remove(row.sha256);
+    await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
     return true;
   });
 }
 
 function enqueueWrite(task) {
+  const queued = writeQueue.then(task);
+  writeQueue = queued.catch(() => {});
+  return queued;
+}
+
+function enqueueRead(task) {
   const queued = writeQueue.then(task);
   writeQueue = queued.catch(() => {});
   return queued;
@@ -299,8 +296,11 @@ async function insertEntry(html, mono, attachments = [], inlineUploads = []) {
   if (Buffer.byteLength(html, 'utf8') > MAX_ENTRY_BYTES) return { status: 413, error: 'Entry is too large' };
   if (hasOversizedImage(html)) return { status: 413, error: 'An embedded image is too large' };
   try {
-    const id = await enqueueWrite(() => inTransaction(() => writeEntry(html, mono, attachments, inlineUploads)));
-    return { status: 201, entry: await loadEntry(id) };
+    const entry = await enqueueWrite(async () => {
+      const id = await inTransaction(() => writeEntry(html, mono, attachments, inlineUploads));
+      return loadEntry(id);
+    });
+    return { status: 201, entry };
   } catch (error) {
     return { status: error.status || 500, error: error.status ? error.message : 'Unable to save entry' };
   }
@@ -505,7 +505,7 @@ const VISIBLE_FILE = `SELECT a.id, a.sha256, a.name, a.type, a.size FROM attachm
 app.get('/api/files/:id/:name', async (req, res) => {
   const id = entryId(req.params.id);
   if (id === null) return res.status(404).type('text/plain').send('File not found\n');
-  return sendStoredFile(req, res, await get(`${VISIBLE_FILE} AND a.id = ?`, [id]));
+  return sendStoredFile(req, res, await enqueueRead(() => get(`${VISIBLE_FILE} AND a.id = ?`, [id])));
 });
 
 // Terminal download of the n-th file of an entry:  curl -skOJ https://<host>/clipboard/api/messages/12/files/1
@@ -513,7 +513,7 @@ app.get('/api/messages/:id/files/:index', async (req, res) => {
   const id = entryId(req.params.id);
   const index = entryId(req.params.index);
   if (id === null || !index) return res.status(404).type('text/plain').send('File not found\n');
-  return sendStoredFile(req, res, await get(`${VISIBLE_FILE} AND a.message_id = ? AND a.inline = 0 ORDER BY a.id LIMIT 1 OFFSET ?`, [id, index - 1]));
+  return sendStoredFile(req, res, await enqueueRead(() => get(`${VISIBLE_FILE} AND a.message_id = ? AND a.inline = 0 ORDER BY a.id LIMIT 1 OFFSET ?`, [id, index - 1])));
 });
 
 // Removes a composer upload that was not sent (the chip's ✕ button); needs its token in X-Upload-Token.
@@ -537,7 +537,7 @@ app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
 
 app.get('/api/config', async (req, res) => {
   let filesBytesUsedNow = null;
-  try { filesBytesUsedNow = await filesBytesUsed(); } catch { /* reported as unknown */ }
+  try { filesBytesUsedNow = await enqueueRead(() => filesBytesUsed()); } catch { /* reported as unknown */ }
   res.set('Cache-Control', 'no-store');
   return res.json({
     retentionSeconds: RETENTION_SECONDS,
@@ -551,8 +551,10 @@ app.get('/api/config', async (req, res) => {
 
 app.get('/api/messages', async (req, res) => {
   try {
-    const rows = await all(`SELECT ${ENTRY_COLUMNS} FROM messages WHERE deleted_at IS NULL ORDER BY is_pinned DESC, id DESC`);
-    const files = await filesByEntry(rows.map((row) => row.id));
+    const { rows, files } = await enqueueRead(async () => {
+      const rows = await all(`SELECT ${ENTRY_COLUMNS} FROM messages WHERE deleted_at IS NULL ORDER BY is_pinned DESC, id DESC`);
+      return { rows, files: await filesByEntry(rows.map((row) => row.id)) };
+    });
     return res.json(rows.map((row) => toEntry(row, files.get(row.id) || [])));
   } catch {
     return res.status(500).json({ error: 'Unable to load entries' });
@@ -579,10 +581,12 @@ function publicBase(req) {
 
 async function sendEntryText(req, res, sql, params) {
   try {
-    const row = await get(sql, params);
+    const { row, files } = await enqueueRead(async () => {
+      const row = await get(sql, params);
+      return { row, files: row ? (await filesByEntry([row.id])).get(row.id) || [] : [] };
+    });
     res.set('Cache-Control', 'no-store');
     if (!row) return res.status(404).type('text/plain').send('Entry not found\n');
-    const files = (await filesByEntry([row.id])).get(row.id) || [];
     const text = htmlToPlainText(row.message);
     const fileLines = files.map((file) => `[file] ${file.name} (${formatBytes(file.size)}) ${publicBase(req)}${file.url}`);
     return res.type('text/plain').send(`${[text, ...fileLines].filter(Boolean).join('\n')}\n`);
@@ -607,9 +611,12 @@ app.patch('/api/messages/:id', async (req, res) => {
     if (typeof req.body.mono === 'boolean') { updates.push('mono = ?'); params.push(req.body.mono ? 1 : 0); }
     if (typeof req.body.is_pinned === 'boolean') { updates.push('is_pinned = ?'); params.push(req.body.is_pinned ? 1 : 0); }
     params.push(id);
-    const result = await run(`UPDATE messages SET ${updates.join(', ')} WHERE id = ? AND deleted_at IS NULL`, params);
-    if (!result.changes) return res.status(404).json({ error: 'Entry not found' });
-    return res.json(await loadEntry(id));
+    const entry = await enqueueWrite(async () => {
+      const result = await run(`UPDATE messages SET ${updates.join(', ')} WHERE id = ? AND deleted_at IS NULL`, params);
+      return result.changes ? loadEntry(id) : null;
+    });
+    if (!entry) return res.status(404).json({ error: 'Entry not found' });
+    return res.json(entry);
   } catch {
     return res.status(500).json({ error: 'Unable to update entry' });
   }
@@ -620,7 +627,7 @@ app.delete('/api/messages/:id', async (req, res) => {
   const id = entryId(req.params.id);
   if (id === null) return res.status(400).json({ error: 'Invalid entry id' });
   try {
-    const result = await run("UPDATE messages SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND deleted_at IS NULL", [id]);
+    const result = await enqueueWrite(() => run("UPDATE messages SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND deleted_at IS NULL", [id]));
     if (!result.changes) return res.status(404).json({ error: 'Entry not found' });
     return res.status(204).send();
   } catch {
@@ -632,12 +639,15 @@ app.put('/api/messages/:id/restore', async (req, res) => {
   const id = entryId(req.params.id);
   if (id === null) return res.status(400).json({ error: 'Invalid entry id' });
   try {
-    const result = await run(
-      "UPDATE messages SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL AND julianday(deleted_at) > julianday('now', ?)",
-      [id, `-${RESTORE_WINDOW_SECONDS} seconds`],
-    );
-    if (!result.changes) return res.status(404).json({ error: 'Entry not found' });
-    return res.json(await loadEntry(id));
+    const entry = await enqueueWrite(async () => {
+      const result = await run(
+        "UPDATE messages SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL AND julianday(deleted_at) > julianday('now', ?)",
+        [id, `-${RESTORE_WINDOW_SECONDS} seconds`],
+      );
+      return result.changes ? loadEntry(id) : null;
+    });
+    if (!entry) return res.status(404).json({ error: 'Entry not found' });
+    return res.json(entry);
   } catch {
     return res.status(500).json({ error: 'Unable to restore entry' });
   }

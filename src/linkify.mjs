@@ -3,7 +3,7 @@
 
 // Common prose separators are not part of a URL. Keep URL path/query punctuation such as
 // `?`, `&`, `=`, parentheses and brackets, but split addresses joined by pipes or backslashes.
-const URL_CANDIDATE = /\bhttps?:\/\/[^\s<>"'`\\]+/gi;
+const URL_CANDIDATE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
 const CLOSERS = { ')': '(', ']': '[', '}': '{' };
 
 function count(text, char) {
@@ -36,7 +36,7 @@ export function findUrls(text) {
   const found = [];
   for (const match of String(text).matchAll(URL_CANDIDATE)) {
     let offset = 0;
-    for (const candidate of match[0].split(/\|(?=https?:\/\/)/i)) {
+    for (const candidate of match[0].split(/[|\\](?=https?:\/\/)/i)) {
       const url = trimUrl(candidate);
       if (isWebUrl(url)) found.push({ start: match.index + offset, end: match.index + offset + url.length, url });
       offset += candidate.length + 1;
